@@ -1,0 +1,4 @@
+max_width = 90
+space_before_colon = false
+space_after_colon = true
+match_arm_leading_pipes = "Always"
