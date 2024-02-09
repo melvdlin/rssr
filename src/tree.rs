@@ -186,4 +186,16 @@ mod tests {
         ));
         assert_abs_diff_eq!(3.0f64, tree.evaluate(&[],), epsilon = f64::EPSILON);
     }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn invalid_variable_count() {
+        let tree = Node::BinaryOp(BinaryOp::new(
+            super::super::ops::BinaryOp::new(std::ops::Add::add),
+            Node::Constant(Constant::new(1f64)),
+            Node::Constant(Constant::new(2f64)),
+        ));
+        tree.evaluate(&[1.0]);
+    }
 }
