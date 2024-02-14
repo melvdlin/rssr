@@ -1,11 +1,13 @@
+pub mod eval;
+
 use std::marker::PhantomData;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Node<T> {
+pub enum Node<T, U, B> {
     Constant(Constant<T>),
     Variable(Variable<T>),
-    UnaryOp(UnaryOp<T>),
-    BinaryOp(BinaryOp<T>),
+    UnaryOp(UnaryOp<T, U, B>),
+    BinaryOp(BinaryOp<T, U, B>),
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
@@ -20,28 +22,26 @@ pub struct Variable<T> {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 
-pub struct UnaryOp<T> {
-    operator: super::ops::UnaryOp<T>,
-    operand: Box<Node<T>>,
+pub struct UnaryOp<T, U, B> {
+    operator: U,
+    operand: Box<Node<T, U, B>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 
-pub struct BinaryOp<T> {
-    operator: super::ops::BinaryOp<T>,
-    lhs: Box<Node<T>>,
-    rhs: Box<Node<T>>,
+pub struct BinaryOp<T, U, B> {
+    operator: B,
+    lhs: Box<Node<T, U, B>>,
+    rhs: Box<Node<T, U, B>>,
 }
 
-#[enum_delegate::register]
 trait Tree {
     type T: Clone;
     fn size(&self) -> usize;
     fn variable_count(&self) -> usize;
-    fn evaluate(&self, variables: &[Self::T]) -> Self::T;
 }
 
-impl<T: Clone> Tree for Node<T> {
+impl<T: Clone, U, B> Tree for Node<T, U, B> {
     type T = T;
 
     fn size(&self) -> usize {
@@ -61,15 +61,6 @@ impl<T: Clone> Tree for Node<T> {
             | Node::BinaryOp(binary_op) => binary_op.variable_count(),
         }
     }
-
-    fn evaluate(&self, variables: &[Self::T]) -> Self::T {
-        match self {
-            | Node::Constant(constant) => constant.evaluate(variables),
-            | Node::Variable(variable) => variable.evaluate(variables),
-            | Node::UnaryOp(unary_op) => unary_op.evaluate(variables),
-            | Node::BinaryOp(binary_op) => binary_op.evaluate(variables),
-        }
-    }
 }
 
 impl<T> Constant<T> {
@@ -86,11 +77,6 @@ impl<T: Clone> Tree for Constant<T> {
 
     fn variable_count(&self) -> usize {
         0
-    }
-
-    fn evaluate(&self, variables: &[Self::T]) -> Self::T {
-        debug_assert!(variables.is_empty());
-        self.value.clone()
     }
 }
 
@@ -112,15 +98,10 @@ impl<T: Clone> Tree for Variable<T> {
     fn variable_count(&self) -> usize {
         1
     }
-
-    fn evaluate(&self, variables: &[Self::T]) -> Self::T {
-        debug_assert!(variables.len() == 1);
-        variables[0].clone()
-    }
 }
 
-impl<T> UnaryOp<T> {
-    pub fn new(operator: super::ops::UnaryOp<T>, operand: Node<T>) -> Self {
+impl<T, U, B> UnaryOp<T, U, B> {
+    pub fn new(operator: U, operand: Node<T, U, B>) -> Self {
         Self {
             operator,
             operand: Box::new(operand),
@@ -128,7 +109,7 @@ impl<T> UnaryOp<T> {
     }
 }
 
-impl<T: Clone> Tree for UnaryOp<T> {
+impl<T: Clone, U, B> Tree for UnaryOp<T, U, B> {
     type T = T;
 
     fn size(&self) -> usize {
@@ -138,14 +119,10 @@ impl<T: Clone> Tree for UnaryOp<T> {
     fn variable_count(&self) -> usize {
         self.operand.variable_count()
     }
-
-    fn evaluate(&self, variables: &[Self::T]) -> Self::T {
-        self.operator.apply(self.operand.evaluate(variables))
-    }
 }
 
-impl<T> BinaryOp<T> {
-    pub fn new(operator: super::ops::BinaryOp<T>, lhs: Node<T>, rhs: Node<T>) -> Self {
+impl<T, U, B> BinaryOp<T, U, B> {
+    pub fn new(operator: B, lhs: Node<T, U, B>, rhs: Node<T, U, B>) -> Self {
         Self {
             operator,
             lhs: Box::new(lhs),
@@ -154,7 +131,7 @@ impl<T> BinaryOp<T> {
     }
 }
 
-impl<T: Clone> Tree for BinaryOp<T> {
+impl<T: Clone, U, B> Tree for BinaryOp<T, U, B> {
     type T = T;
 
     fn size(&self) -> usize {
@@ -163,39 +140,5 @@ impl<T: Clone> Tree for BinaryOp<T> {
 
     fn variable_count(&self) -> usize {
         self.lhs.variable_count() + self.rhs.variable_count()
-    }
-
-    fn evaluate(&self, variables: &[Self::T]) -> Self::T {
-        let (lvars, rvars) = variables.split_at(self.lhs.variable_count());
-        self.operator
-            .apply(self.lhs.evaluate(lvars), self.rhs.evaluate(rvars))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use approx::assert_abs_diff_eq;
-
-    #[test]
-    fn simple_eval() {
-        let tree = Node::BinaryOp(BinaryOp::new(
-            super::super::ops::BinaryOp::new(std::ops::Add::add),
-            Node::Constant(Constant::new(1f64)),
-            Node::Constant(Constant::new(2f64)),
-        ));
-        assert_abs_diff_eq!(3.0f64, tree.evaluate(&[],), epsilon = f64::EPSILON);
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic]
-    fn invalid_variable_count() {
-        let tree = Node::BinaryOp(BinaryOp::new(
-            super::super::ops::BinaryOp::new(std::ops::Add::add),
-            Node::Constant(Constant::new(1f64)),
-            Node::Constant(Constant::new(2f64)),
-        ));
-        tree.evaluate(&[1.0]);
     }
 }
