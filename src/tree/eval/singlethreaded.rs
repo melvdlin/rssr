@@ -17,7 +17,10 @@ impl<T: Clone> Evaluator<T, cpu::UnaryOp<T>, cpu::BinaryOp<T>>
         variables: &[T],
     ) -> Result<Self::R, Self::E> {
         match tree {
-            | Node::Constant(crate::tree::Constant { value }) => Ok(value.clone()),
+            | Node::Constant(crate::tree::Constant { value }) => {
+                assert!(variables.is_empty());
+                Ok(value.clone())
+            }
             | Node::Variable(crate::tree::Variable { .. }) => Ok(variables[0].clone()),
             | Node::UnaryOp(crate::tree::UnaryOp { operator, operand }) => {
                 Ok(operator.apply(self.evaluate(operand, variables)?))
