@@ -17,6 +17,7 @@ pub struct Constant<T> {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct Variable<T> {
+    id: usize,
     _phantom: PhantomData<T>,
 }
 
@@ -38,7 +39,6 @@ pub struct BinaryOp<T, U, B> {
 trait Tree {
     type T: Clone;
     fn size(&self) -> usize;
-    fn variable_count(&self) -> usize;
 }
 
 impl<T: Clone, U, B> Tree for Node<T, U, B> {
@@ -50,15 +50,6 @@ impl<T: Clone, U, B> Tree for Node<T, U, B> {
             | Node::Variable(variable) => variable.size(),
             | Node::UnaryOp(unary_op) => unary_op.size(),
             | Node::BinaryOp(binary_op) => binary_op.size(),
-        }
-    }
-
-    fn variable_count(&self) -> usize {
-        match self {
-            | Node::Constant(constant) => constant.variable_count(),
-            | Node::Variable(variable) => variable.variable_count(),
-            | Node::UnaryOp(unary_op) => unary_op.variable_count(),
-            | Node::BinaryOp(binary_op) => binary_op.variable_count(),
         }
     }
 }
@@ -74,15 +65,12 @@ impl<T: Clone> Tree for Constant<T> {
     fn size(&self) -> usize {
         1
     }
-
-    fn variable_count(&self) -> usize {
-        0
-    }
 }
 
 impl<T> Variable<T> {
-    pub fn new() -> Self {
+    pub fn new(id: usize) -> Self {
         Self {
+            id,
             _phantom: PhantomData,
         }
     }
@@ -92,10 +80,6 @@ impl<T: Clone> Tree for Variable<T> {
     type T = T;
 
     fn size(&self) -> usize {
-        1
-    }
-
-    fn variable_count(&self) -> usize {
         1
     }
 }
@@ -115,10 +99,6 @@ impl<T: Clone, U, B> Tree for UnaryOp<T, U, B> {
     fn size(&self) -> usize {
         self.operand.size() + 1
     }
-
-    fn variable_count(&self) -> usize {
-        self.operand.variable_count()
-    }
 }
 
 impl<T, U, B> BinaryOp<T, U, B> {
@@ -136,9 +116,5 @@ impl<T: Clone, U, B> Tree for BinaryOp<T, U, B> {
 
     fn size(&self) -> usize {
         self.lhs.size() + 1 + self.rhs.size()
-    }
-
-    fn variable_count(&self) -> usize {
-        self.lhs.variable_count() + self.rhs.variable_count()
     }
 }

@@ -1,6 +1,6 @@
 use crate::ops::cpu;
 use crate::tree::eval::Evaluator;
-use crate::tree::{Node, Tree};
+use crate::tree::Node;
 use std::convert::Infallible;
 
 pub struct SingleThreadedEvaluator;
@@ -18,18 +18,19 @@ impl<T: Clone> Evaluator<T, cpu::UnaryOp<T>, cpu::BinaryOp<T>>
     ) -> Result<Self::R, Self::E> {
         match tree {
             | Node::Constant(crate::tree::Constant { value }) => {
-                assert!(variables.is_empty());
+                debug_assert!(variables.is_empty());
                 Ok(value.clone())
             }
-            | Node::Variable(crate::tree::Variable { .. }) => Ok(variables[0].clone()),
+            | Node::Variable(crate::tree::Variable { id, .. }) => {
+                Ok(variables[*id].clone())
+            }
             | Node::UnaryOp(crate::tree::UnaryOp { operator, operand }) => {
                 Ok(operator.apply(self.evaluate(operand, variables)?))
             }
             | Node::BinaryOp(crate::tree::BinaryOp { operator, lhs, rhs }) => {
-                let lhs_variable_count = lhs.variable_count();
                 Ok(operator.apply(
-                    self.evaluate(lhs, &variables[..lhs_variable_count])?,
-                    self.evaluate(rhs, &variables[lhs_variable_count..])?,
+                    self.evaluate(lhs, variables)?,
+                    self.evaluate(rhs, variables)?,
                 ))
             }
         }
@@ -39,7 +40,7 @@ impl<T: Clone> Evaluator<T, cpu::UnaryOp<T>, cpu::BinaryOp<T>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{BinaryOp, Constant};
+    use crate::tree::{BinaryOp, Constant, Variable};
     use approx::assert_abs_diff_eq;
 
     fn simple_tree() -> Node<f64, cpu::UnaryOp<f64>, cpu::BinaryOp<f64>> {
@@ -50,11 +51,19 @@ mod tests {
         ))
     }
 
+    fn simple_tree_with_variables() -> Node<f64, cpu::UnaryOp<f64>, cpu::BinaryOp<f64>> {
+        Node::BinaryOp(BinaryOp::new(
+            cpu::BinaryOp::new(std::ops::Add::add),
+            Node::Variable(Variable::new(0)),
+            Node::Variable(Variable::new(1)),
+        ))
+    }
+
     #[test]
     fn simple_eval() {
         let tree = simple_tree();
         assert_abs_diff_eq!(
-            3.0f64,
+            3.0,
             SingleThreadedEvaluator.evaluate(&tree, &[],).unwrap(),
             epsilon = f64::EPSILON
         );
@@ -62,9 +71,14 @@ mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic]
-    fn invalid_variable_count() {
-        let tree = simple_tree();
-        SingleThreadedEvaluator.evaluate(&tree, &[1.0]).unwrap();
+    fn variable_eval() {
+        let tree = simple_tree_with_variables();
+        assert_abs_diff_eq!(
+            3.0,
+            SingleThreadedEvaluator
+                .evaluate(&tree, &[1.0, 2.0])
+                .unwrap(),
+            epsilon = f64::EPSILON
+        );
     }
 }
