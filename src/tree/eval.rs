@@ -1,5 +1,6 @@
 use crate::tree::Node;
 
+pub mod gpu;
 pub mod singlethreaded;
 
 pub trait Evaluator<T, U, B> {
