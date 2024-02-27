@@ -3,11 +3,10 @@ pub mod eval;
 use std::marker::PhantomData;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Node<T, U, B> {
+pub enum Node<T, F> {
     Constant(Constant<T>),
     Variable(Variable<T>),
-    UnaryOp(UnaryOp<T, U, B>),
-    BinaryOp(BinaryOp<T, U, B>),
+    Function(Function<T, F>),
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
@@ -23,33 +22,28 @@ pub struct Variable<T> {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 
-pub struct UnaryOp<T, U, B> {
-    operator: U,
-    operand: Box<Node<T, U, B>>,
+pub struct Function<T, F> {
+    function: F,
+    operands: Box<[Node<T, F>]>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-
-pub struct BinaryOp<T, U, B> {
-    operator: B,
-    lhs: Box<Node<T, U, B>>,
-    rhs: Box<Node<T, U, B>>,
-}
-
-trait Tree {
+pub trait Tree {
     type T: Clone;
     fn size(&self) -> usize;
 }
 
-impl<T: Clone, U, B> Tree for Node<T, U, B> {
+pub trait NAryFunction {
+    fn arity(&self) -> usize;
+}
+
+impl<T: Clone, F: NAryFunction> Tree for Node<T, F> {
     type T = T;
 
     fn size(&self) -> usize {
         match self {
             | Node::Constant(constant) => constant.size(),
             | Node::Variable(variable) => variable.size(),
-            | Node::UnaryOp(unary_op) => unary_op.size(),
-            | Node::BinaryOp(binary_op) => binary_op.size(),
+            | Node::Function(function) => function.size(),
         }
     }
 }
@@ -84,37 +78,24 @@ impl<T: Clone> Tree for Variable<T> {
     }
 }
 
-impl<T, U, B> UnaryOp<T, U, B> {
-    pub fn new(operator: U, operand: Node<T, U, B>) -> Self {
+impl<T: Clone, F: NAryFunction + Clone> Function<T, F> {
+    pub fn new(function: F, operands: &[Node<T, F>]) -> Self {
+        assert_eq!(function.arity(), operands.len());
         Self {
-            operator,
-            operand: Box::new(operand),
+            function,
+            operands: operands.into(),
         }
+    }
+
+    pub fn arity(&self) -> usize {
+        self.function.arity()
     }
 }
 
-impl<T: Clone, U, B> Tree for UnaryOp<T, U, B> {
+impl<T: Clone, F: NAryFunction> Tree for Function<T, F> {
     type T = T;
 
     fn size(&self) -> usize {
-        self.operand.size() + 1
-    }
-}
-
-impl<T, U, B> BinaryOp<T, U, B> {
-    pub fn new(operator: B, lhs: Node<T, U, B>, rhs: Node<T, U, B>) -> Self {
-        Self {
-            operator,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-        }
-    }
-}
-
-impl<T: Clone, U, B> Tree for BinaryOp<T, U, B> {
-    type T = T;
-
-    fn size(&self) -> usize {
-        self.lhs.size() + 1 + self.rhs.size()
+        self.function.arity() + 1
     }
 }

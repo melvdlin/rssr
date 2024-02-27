@@ -1,19 +1,18 @@
 use crate::ops::cpu;
 use crate::tree::eval::Evaluator;
 use crate::tree::Node;
+
 use std::convert::Infallible;
 
 pub struct SingleThreadedEvaluator;
 
-impl<T: Clone> Evaluator<T, cpu::UnaryOp<T>, cpu::BinaryOp<T>>
-    for SingleThreadedEvaluator
-{
+impl<T: Clone> Evaluator<T, cpu::Function<T>> for SingleThreadedEvaluator {
     type R = T;
     type E = Infallible;
 
     fn evaluate(
         &mut self,
-        tree: &Node<T, cpu::UnaryOp<T>, cpu::BinaryOp<T>>,
+        tree: &Node<T, cpu::Function<T>>,
         variables: &[T],
     ) -> Result<Self::R, Self::E> {
         match tree {
@@ -24,13 +23,13 @@ impl<T: Clone> Evaluator<T, cpu::UnaryOp<T>, cpu::BinaryOp<T>>
             | Node::Variable(crate::tree::Variable { id, .. }) => {
                 Ok(variables[*id].clone())
             }
-            | Node::UnaryOp(crate::tree::UnaryOp { operator, operand }) => {
-                Ok(operator.apply(self.evaluate(operand, variables)?))
-            }
-            | Node::BinaryOp(crate::tree::BinaryOp { operator, lhs, rhs }) => {
-                Ok(operator.apply(
-                    self.evaluate(lhs, variables)?,
-                    self.evaluate(rhs, variables)?,
+            | Node::Function(crate::tree::Function { function, operands }) => {
+                Ok(function.apply(
+                    operands
+                        .iter()
+                        .map(|node| self.evaluate(node, variables))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .as_slice(),
                 ))
             }
         }
@@ -40,22 +39,28 @@ impl<T: Clone> Evaluator<T, cpu::UnaryOp<T>, cpu::BinaryOp<T>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{BinaryOp, Constant, Variable};
+    use crate::tree::{Constant, Function, Variable};
     use approx::assert_abs_diff_eq;
 
-    fn simple_tree() -> Node<f64, cpu::UnaryOp<f64>, cpu::BinaryOp<f64>> {
-        Node::BinaryOp(BinaryOp::new(
-            cpu::BinaryOp::new(std::ops::Add::add),
-            Node::Constant(Constant::new(1f64)),
-            Node::Constant(Constant::new(2f64)),
+    fn simple_tree() -> Node<f64, cpu::Function<f64>> {
+        Node::Function(Function::new(
+            cpu::Function::new(2, |operands| operands.iter().sum()),
+            [
+                Node::Constant(Constant::new(1f64)),
+                Node::Constant(Constant::new(2f64)),
+            ]
+            .as_slice(),
         ))
     }
 
-    fn simple_tree_with_variables() -> Node<f64, cpu::UnaryOp<f64>, cpu::BinaryOp<f64>> {
-        Node::BinaryOp(BinaryOp::new(
-            cpu::BinaryOp::new(std::ops::Add::add),
-            Node::Variable(Variable::new(0)),
-            Node::Variable(Variable::new(1)),
+    fn simple_tree_with_variables() -> Node<f64, cpu::Function<f64>> {
+        Node::Function(Function::new(
+            cpu::Function::new(2, |operands| operands.iter().sum()),
+            [
+                Node::Variable(Variable::new(0)),
+                Node::Variable(Variable::new(1)),
+            ]
+            .as_slice(),
         ))
     }
 

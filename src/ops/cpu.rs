@@ -1,29 +1,23 @@
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-
-pub struct UnaryOp<T> {
-    operation: fn(T) -> T,
-}
+use crate::tree::NAryFunction;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-
-pub struct BinaryOp<T> {
-    operation: fn(T, T) -> T,
+pub struct Function<T> {
+    arity: usize,
+    operation: fn(&[T]) -> T,
 }
 
-impl<T> UnaryOp<T> {
-    pub fn new(operation: fn(T) -> T) -> Self {
-        Self { operation }
+impl<T> Function<T> {
+    pub fn new(arity: usize, operation: fn(&[T]) -> T) -> Self {
+        Self { arity, operation }
     }
-    pub fn apply(&self, arg: T) -> T {
+    pub fn apply(&self, arg: &[T]) -> T {
+        assert_eq!(self.arity, arg.len());
         (self.operation)(arg)
     }
 }
 
-impl<T> BinaryOp<T> {
-    pub fn new(operation: fn(T, T) -> T) -> Self {
-        Self { operation }
-    }
-    pub fn apply(&self, arg1: T, arg2: T) -> T {
-        (self.operation)(arg1, arg2)
+impl<T> NAryFunction for Function<T> {
+    fn arity(&self) -> usize {
+        self.arity
     }
 }

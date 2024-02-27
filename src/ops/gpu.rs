@@ -1,25 +1,14 @@
 use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub enum UnaryOp {
-    Builtin(UnaryBuiltin),
-    Custom(UnaryCustom),
+pub enum Function {
+    Builtin(Builtin),
+    Custom(Custom),
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-
-pub enum BinaryOp {
-    Builtin(BinaryBuiltin),
-    Custom(BinaryCustom),
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub enum UnaryBuiltin {
+pub enum Builtin {
     Neg,
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub enum BinaryBuiltin {
     Add,
     Sub,
     Mul,
@@ -29,38 +18,19 @@ pub enum BinaryBuiltin {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct UnaryCustom {
+pub struct Custom {
     id: usize,
 }
 
-#[derive(Debug, Copy, Clone)]
-pub struct BinaryCustom {
-    id: usize,
-}
-
-impl PartialEq for UnaryCustom {
+impl PartialEq for Custom {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
-impl Eq for UnaryCustom {}
+impl Eq for Custom {}
 
-impl Hash for UnaryCustom {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_usize(self.id)
-    }
-}
-
-impl PartialEq for BinaryCustom {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl Eq for BinaryCustom {}
-
-impl Hash for BinaryCustom {
+impl Hash for Custom {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_usize(self.id)
     }
