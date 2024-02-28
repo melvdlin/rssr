@@ -1,28 +1,164 @@
+use crate::tree::{NAryFunction, Node};
 use anyhow::Context;
+use glsl_lang::ast::{FunctionDefinition, FunctionPrototype};
 use shaderc::{CompileOptions, Compiler, OptimizationLevel, SourceLanguage, TargetEnv};
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::ops::Index;
 
 pub struct DynamicEvaluator<'a> {
     compiler: Compiler,
     options: CompileOptions<'a>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct GlslFunction {
-    identifier: String,
-    definition: String,
+#[derive(Debug, Clone, PartialEq)]
+enum GlslFunction {
+    Builtin(BuiltinGlslFunction),
+    Custom(CustomGlslFunction),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct GlslUnaryOperator(GlslFunction);
+#[derive(Debug, Clone)]
+pub enum GlslFunctionDefinition {
+    Builtin(BuiltinGlslFunction),
+    Custom(CustomGlslFunctionDefinition),
+}
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct GlslBinaryOperator(GlslFunction);
+#[derive(Debug, Clone, PartialEq)]
+enum BuiltinGlslFunction {
+    NonOperatorFunction(GlslNonOperatorFunction),
+    Operator(GlslOperator),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GlslNonOperatorFunction {
+    prototype: FunctionPrototype,
+}
+
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+enum GlslOperator {
+    Unary(GlslUnaryOperator),
+    Binary(GlslBinaryOperator),
+}
+
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+enum GlslUnaryOperator {
+    Neg,
+}
+
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+enum GlslBinaryOperator {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Debug, Clone)]
+struct CustomGlslFunction {
+    id: usize,
+    arity: usize,
+    ast: FunctionDefinition,
+}
+
+#[derive(Debug, Clone)]
+struct CustomGlslFunctionDefinition {
+    ast: FunctionDefinition,
+}
+
+impl NAryFunction for GlslNonOperatorFunction {
+    fn arity(&self) -> usize {
+        todo!()
+    }
+}
+
+impl NAryFunction for GlslOperator {
+    fn arity(&self) -> usize {
+        match self {
+            | GlslOperator::Unary(unary) => unary.arity(),
+            | GlslOperator::Binary(binary) => binary.arity(),
+        }
+    }
+}
+
+impl GlslUnaryOperator {
+    fn postfix(self) -> bool {
+        match self {
+            | GlslUnaryOperator::Neg => false,
+        }
+    }
+}
+
+impl NAryFunction for GlslUnaryOperator {
+    fn arity(&self) -> usize {
+        1
+    }
+}
+
+impl NAryFunction for GlslBinaryOperator {
+    fn arity(&self) -> usize {
+        2
+    }
+}
+
+impl From<GlslUnaryOperator> for glsl_lang::lexer::Token {
+    fn from(value: GlslUnaryOperator) -> Self {
+        use glsl_lang::lexer::Token;
+        match value {
+            | GlslUnaryOperator::Neg => Token::Dash,
+        }
+    }
+}
+
+impl From<GlslBinaryOperator> for glsl_lang::lexer::Token {
+    fn from(value: GlslBinaryOperator) -> Self {
+        use glsl_lang::lexer::Token;
+        match value {
+            | GlslBinaryOperator::Add => Token::Plus,
+            | GlslBinaryOperator::Sub => Token::Dash,
+            | GlslBinaryOperator::Mul => Token::Star,
+            | GlslBinaryOperator::Div => Token::Slash,
+        }
+    }
+}
+
+impl PartialOrd for CustomGlslFunction {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CustomGlslFunction {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.id.cmp(&other.id)
+    }
+}
+
+impl PartialEq for CustomGlslFunction {
+    fn eq(&self, other: &Self) -> bool {
+        self.id.eq(&other.id)
+    }
+}
+
+impl Eq for CustomGlslFunction {}
+
+impl NAryFunction for CustomGlslFunction {
+    fn arity(&self) -> usize {
+        debug_assert_eq!(self.arity, self.ast.prototype.parameters.len());
+        self.arity
+    }
+}
+
+impl NAryFunction for CustomGlslFunctionDefinition {
+    fn arity(&self) -> usize {
+        self.ast.prototype.parameters.len()
+    }
+}
 
 impl<'a> DynamicEvaluator<'a> {
-    const SHADER_SOURCE: &'static str = todo!();
+    const SHADER_SOURCE: &'static str = "";
     const OPERATORS_MACRO_IDENTIFIER: &'static str = "OPERATORS";
 
-    pub fn new(operators: &[crate::ops::gpu::Function]) -> anyhow::Result<Self> {
+    pub fn new(functions: &[GlslFunctionDefinition]) -> anyhow::Result<Self> {
         let compiler =
             Compiler::new().with_context(|| "Failed to initialise SPIRV compiler")?;
         let mut options = CompileOptions::new()
@@ -38,7 +174,52 @@ impl<'a> DynamicEvaluator<'a> {
         Ok(Self { compiler, options })
     }
 
-    fn generate_operators() -> ! {
+    fn generate_functions(
+        definitions: &[GlslFunctionDefinition],
+    ) -> BTreeMap<crate::ops::gpu::Function, GlslFunction> {
+        definitions
+            .iter()
+            .enumerate()
+            .map(|(idx, definition)| match definition {
+                | GlslFunctionDefinition::Builtin(builtin) => todo!(),
+                | GlslFunctionDefinition::Custom(custom) => todo!(),
+            })
+            .collect::<BTreeMap<crate::ops::gpu::Function, GlslFunction>>()
+    }
+
+    fn generate_eval_expr_ast(
+        tree: &Node<f32, crate::ops::gpu::Function>,
+        operators: &impl Index<crate::ops::gpu::Function, Output = GlslFunction>,
+    ) -> glsl_lang::ast::Expr {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glsl_lang::ast;
+    use glsl_lang::ast::NodeDisplay;
+
+    #[test]
+    fn render() -> anyhow::Result<()> {
+        use glsl_lang::ast::*;
+        use glsl_lang::parse::DefaultParse;
+        use glsl_lang::transpiler::glsl::*;
+
+        let source = r"
+            float mul(float a, float b) {
+                float result = a * b;
+                return result;
+            }";
+
+        let ast = ast::TranslationUnit::parse(source)?;
+
+        let mut rendered = String::new();
+        show_translation_unit(&mut rendered, &ast, FormattingState::default())?;
+
+        println!("rendered GLSL AST:\n{}", rendered);
+
+        Ok(())
     }
 }

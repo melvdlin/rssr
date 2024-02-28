@@ -6,7 +6,7 @@ use shaderc::{
 pub struct StaticEvaluator {}
 
 impl StaticEvaluator {
-    const SHADER_SOURCE: &'static str = todo!();
+    const SHADER_SOURCE: &'static str = "";
     const DISPATCH_MACRO_IDENTIFIER: &'static str = "DISPATCH";
     const OPERATORS_MACRO_IDENTIFIER: &'static str = "OPERATORS";
 

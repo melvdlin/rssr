@@ -1,37 +1,30 @@
+use crate::tree::NAryFunction;
 use std::hash::{Hash, Hasher};
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub enum Function {
-    Builtin(Builtin),
-    Custom(Custom),
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub enum Builtin {
-    Neg,
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Rem,
-    Pow,
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct Custom {
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub struct Function {
     id: usize,
+    arity: usize,
 }
 
-impl PartialEq for Custom {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+impl Function {
+    pub fn new(id: usize, arity: usize) -> Self {
+        Self { id, arity }
+    }
+
+    pub fn id(self) -> usize {
+        self.id
     }
 }
 
-impl Eq for Custom {}
-
-impl Hash for Custom {
+impl Hash for Function {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_usize(self.id)
+    }
+}
+
+impl NAryFunction for Function {
+    fn arity(&self) -> usize {
+        self.arity
     }
 }
