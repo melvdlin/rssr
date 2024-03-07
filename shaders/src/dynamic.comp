@@ -33,7 +33,7 @@ layout (local_size = LOCAL_SIZE_X, local_size_y = LOCAL_SIZE_Y, local_size_z = 1
 uint _prefactor(uint permutationIdx, uint nodeIdx);
 float32_t _sample(uint batchIdx, uint dimension);
 
-USER_FUNCTION_DECLARATIONS;
+USER_FUNCTION_DECLARATIONS
 
 void _main() {
     uint batchIdx = gl_GlobalInvocationID.x;
@@ -57,4 +57,4 @@ float32_t _sample(uint batchIdx, uint dimension) {
     return preimage[batch[batchIdx] * preimageDimensions + dimension];
 }
 
-USER_FUNCTION_DEFINITIONS;
+USER_FUNCTION_DEFINITIONS
