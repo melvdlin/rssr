@@ -65,9 +65,20 @@ struct CustomGlslFunctionDefinition {
     ast: FunctionDefinition,
 }
 
+impl NAryFunction for BuiltinGlslFunction {
+    fn arity(&self) -> usize {
+        match self {
+            | BuiltinGlslFunction::NonOperatorFunction(non_operator) => {
+                non_operator.arity()
+            }
+            | BuiltinGlslFunction::Operator(operator) => operator.arity(),
+        }
+    }
+}
+
 impl NAryFunction for GlslNonOperatorFunction {
     fn arity(&self) -> usize {
-        todo!()
+        self.prototype.parameters.len()
     }
 }
 
@@ -100,23 +111,60 @@ impl NAryFunction for GlslBinaryOperator {
     }
 }
 
-impl From<GlslUnaryOperator> for glsl_lang::lexer::Token {
+impl From<GlslUnaryOperator> for glsl_lang::ast::UnaryOp {
     fn from(value: GlslUnaryOperator) -> Self {
-        use glsl_lang::lexer::Token;
+        use glsl_lang::ast::*;
         match value {
-            | GlslUnaryOperator::Neg => Token::Dash,
+            | GlslUnaryOperator::Neg => UnaryOp::new(UnaryOpData::Minus, None),
         }
     }
 }
 
-impl From<GlslBinaryOperator> for glsl_lang::lexer::Token {
+impl TryFrom<glsl_lang::ast::UnaryOpData> for GlslUnaryOperator {
+    type Error = ();
+
+    fn try_from(value: glsl_lang::ast::UnaryOpData) -> Result<Self, Self::Error> {
+        use glsl_lang::ast::*;
+        Ok(match value {
+            | UnaryOpData::Minus => Self::Neg,
+            | _ => Err(())?,
+        })
+    }
+}
+
+impl From<GlslBinaryOperator> for glsl_lang::ast::BinaryOpData {
     fn from(value: GlslBinaryOperator) -> Self {
-        use glsl_lang::lexer::Token;
+        use glsl_lang::ast::*;
         match value {
-            | GlslBinaryOperator::Add => Token::Plus,
-            | GlslBinaryOperator::Sub => Token::Dash,
-            | GlslBinaryOperator::Mul => Token::Star,
-            | GlslBinaryOperator::Div => Token::Slash,
+            | GlslBinaryOperator::Add => BinaryOpData::Add,
+            | GlslBinaryOperator::Sub => BinaryOpData::Sub,
+            | GlslBinaryOperator::Mul => BinaryOpData::Mult,
+            | GlslBinaryOperator::Div => BinaryOpData::Div,
+        }
+    }
+}
+
+impl TryFrom<glsl_lang::ast::BinaryOpData> for GlslBinaryOperator {
+    type Error = ();
+
+    fn try_from(value: glsl_lang::ast::BinaryOpData) -> Result<Self, Self::Error> {
+        use glsl_lang::ast::*;
+        Ok(match value {
+            | BinaryOpData::Add => Self::Add,
+            | BinaryOpData::Sub => Self::Sub,
+            | BinaryOpData::Mult => Self::Mul,
+            | BinaryOpData::Div => Self::Div,
+            | _ => Err(())?,
+        })
+    }
+}
+
+impl CustomGlslFunction {
+    fn from_definition(definition: &CustomGlslFunctionDefinition, id: usize) -> Self {
+        Self {
+            id,
+            arity: definition.ast.prototype.parameters.len(),
+            ast: definition.ast.clone(),
         }
     }
 }
@@ -177,14 +225,23 @@ impl<'a> DynamicEvaluator<'a> {
     fn generate_functions(
         definitions: &[GlslFunctionDefinition],
     ) -> BTreeMap<crate::ops::gpu::Function, GlslFunction> {
+        use crate::ops::gpu;
         definitions
             .iter()
             .enumerate()
             .map(|(idx, definition)| match definition {
-                | GlslFunctionDefinition::Builtin(builtin) => todo!(),
-                | GlslFunctionDefinition::Custom(custom) => todo!(),
+                | GlslFunctionDefinition::Builtin(builtin) => (
+                    gpu::Function::new(idx, builtin.arity()),
+                    GlslFunction::Builtin(builtin.clone()),
+                ),
+                | GlslFunctionDefinition::Custom(custom) => (
+                    gpu::Function::new(idx, custom.arity()),
+                    GlslFunction::Custom(CustomGlslFunction::from_definition(
+                        custom, idx,
+                    )),
+                ),
             })
-            .collect::<BTreeMap<crate::ops::gpu::Function, GlslFunction>>()
+            .collect::<BTreeMap<gpu::Function, GlslFunction>>()
     }
 
     fn generate_eval_expr_ast(
