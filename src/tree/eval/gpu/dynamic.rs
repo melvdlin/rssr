@@ -1,6 +1,8 @@
+use crate::proot;
 use crate::tree::{NAryFunction, Node};
 use anyhow::Context;
 use glsl_lang::ast::{FunctionDefinition, FunctionPrototype};
+use glsl_lang::parse::DefaultParse;
 use shaderc::{CompileOptions, Compiler, OptimizationLevel, SourceLanguage, TargetEnv};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -203,7 +205,8 @@ impl NAryFunction for CustomGlslFunctionDefinition {
 }
 
 impl<'a> DynamicEvaluator<'a> {
-    const SHADER_SOURCE: &'static str = "";
+    const SHADER_SOURCE: &'static str =
+        include_str!(proot!("shaders/src/", "dynamic.comp"));
     const OPERATORS_MACRO_IDENTIFIER: &'static str = "OPERATORS";
 
     pub fn new(functions: &[GlslFunctionDefinition]) -> anyhow::Result<Self> {
@@ -211,6 +214,9 @@ impl<'a> DynamicEvaluator<'a> {
             Compiler::new().with_context(|| "Failed to initialise SPIRV compiler")?;
         let mut options = CompileOptions::new()
             .with_context(|| "Failed to initialise SPIRV compile options")?;
+
+        let shader_skeleton =
+            glsl_lang::ast::TranslationUnit::parse(Self::SHADER_SOURCE)?;
 
         options.set_target_env(TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_3 as u32);
         options.set_generate_debug_info();
