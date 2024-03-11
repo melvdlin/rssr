@@ -1,11 +1,12 @@
 #version 460
 
+
 layout (std140, set = 0, binding = 0) readonly buffer Preimage {
-    float32_t preimage[];
+    float preimage[];
 };
 
 layout (std140, set = 0, binding = 1) readonly buffer Image {
-    float32_t image[];
+    float image[];
 };
 
 layout (std140, set = 0, binding = 2) readonly buffer Batch {
@@ -17,7 +18,7 @@ layout (std140, set = 0, binding = 3) readonly buffer PermutationPrefactors {
 };
 
 layout (std140, set = 0, binding = 4) buffer SquaredDeviations {
-    uint squaredDeviations[];
+    float squaredDeviations[];
 };
 
 layout (push_constant) uniform PushConstants {
@@ -28,23 +29,24 @@ layout (push_constant) uniform PushConstants {
     uint expressionSize;
 };
 
-layout (local_size = LOCAL_SIZE_X, local_size_y = LOCAL_SIZE_Y, local_size_z = 1) in;
+layout (local_size_x = LOCAL_SIZE_X, local_size_y = LOCAL_SIZE_Y, local_size_z = 1) in;
 
 uint _prefactor(uint permutationIdx, uint nodeIdx);
-float32_t _sample(uint batchIdx, uint dimension);
+float _sample(uint batchIdx, uint dimension);
+float _eval(uint batchIdx, uint permutationIdx);
 
-USER_FUNCTION_DECLARATIONS
+#include "user-function-declarations"
 
-void _main() {
+void main() {
     uint batchIdx = gl_GlobalInvocationID.x;
     uint permutationIdx = gl_GlobalInvocationID.y;
     bool skip = batchIdx >= batchSize || permutationIdx >= permutations;
 
     if (!skip) {
-        float32_t result = EVAL;
-        float32_t actual = image[batch[batchIdx]];
-        float32_t deviation = result - actual;
-        float32_t squaredDeviation = deviation * deviation;
+        float result = _eval(batchIdx, permutationIdx);
+        float actual = image[batch[batchIdx]];
+        float deviation = result - actual;
+        float squaredDeviation = deviation * deviation;
         squaredDeviations[permutationIdx * batchSize + batchIdx] = squaredDeviation;
     }
 }
@@ -53,8 +55,9 @@ uint _prefactor(uint permutationIdx, uint nodeIdx) {
     return permutationPrefactors[permutationIdx * expressionSize + nodeIdx];
 }
 
-float32_t _sample(uint batchIdx, uint dimension) {
+float _sample(uint batchIdx, uint dimension) {
     return preimage[batch[batchIdx] * preimageDimensions + dimension];
 }
 
-USER_FUNCTION_DEFINITIONS
+#include "user-function-definitions"
+#include "eval-function-definition"

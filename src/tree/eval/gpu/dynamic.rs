@@ -1,12 +1,14 @@
-use crate::proot;
-use crate::tree::{NAryFunction, Node};
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::ops::Index;
+
 use anyhow::Context;
 use glsl_lang::ast::{FunctionDefinition, FunctionPrototype};
 use glsl_lang::parse::DefaultParse;
 use shaderc::{CompileOptions, Compiler, OptimizationLevel, SourceLanguage, TargetEnv};
-use std::cmp::Ordering;
-use std::collections::BTreeMap;
-use std::ops::Index;
+
+use crate::proot;
+use crate::tree::{NAryFunction, Node};
 
 pub struct DynamicEvaluator<'a> {
     compiler: Compiler,
@@ -205,9 +207,16 @@ impl NAryFunction for CustomGlslFunctionDefinition {
 }
 
 impl<'a> DynamicEvaluator<'a> {
-    const SHADER_SOURCE: &'static str =
-        include_str!(proot!("shaders/src/", "dynamic.comp"));
-    const OPERATORS_MACRO_IDENTIFIER: &'static str = "OPERATORS";
+    const SKELETON_SHADER_SOURCE: &'static str =
+        include_str!(proot!("shaders/src/", "skeleton.comp"));
+
+    const USER_FUNCTION_DECLARATIONS_PATH: &'static str = "user-function-declarations";
+    const USER_FUNCTION_DEFINITIONS_PATH: &'static str = "user-function-definitions";
+    const EVAL_FUNCTION_DEFINITION_PATH: &'static str = "eval-function-definition";
+
+    const EVAL_FUNCTION_IDENTIFIER: &'static str = "_eval";
+    const LOCAL_SIZE_X_MACRO_IDENTIFIER: &'static str = "LOCAL_SIZE_X";
+    const LOCAL_SIZE_Y_MACRO_IDENTIFIER: &'static str = "LOCAL_SIZE_Y";
 
     pub fn new(functions: &[GlslFunctionDefinition]) -> anyhow::Result<Self> {
         let compiler =
@@ -215,15 +224,10 @@ impl<'a> DynamicEvaluator<'a> {
         let mut options = CompileOptions::new()
             .with_context(|| "Failed to initialise SPIRV compile options")?;
 
-        let shader_skeleton =
-            glsl_lang::ast::TranslationUnit::parse(Self::SHADER_SOURCE)?;
-
         options.set_target_env(TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_3 as u32);
         options.set_generate_debug_info();
         options.set_optimization_level(OptimizationLevel::Performance);
         options.set_source_language(SourceLanguage::GLSL);
-
-        options.add_macro_definition(Self::OPERATORS_MACRO_IDENTIFIER, Some(todo!()));
 
         Ok(Self { compiler, options })
     }
@@ -260,13 +264,19 @@ impl<'a> DynamicEvaluator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use glsl_lang::ast;
-    use glsl_lang::ast::NodeDisplay;
+
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[test]
+    fn new() -> anyhow::Result<()> {
+        let _ = DynamicEvaluator::new(&[])?;
+        Ok(())
+    }
 
     #[test]
     fn render() -> anyhow::Result<()> {
-        use glsl_lang::ast::*;
         use glsl_lang::parse::DefaultParse;
         use glsl_lang::transpiler::glsl::*;
 
