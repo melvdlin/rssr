@@ -3,12 +3,12 @@ use std::collections::BTreeMap;
 use std::ops::Index;
 
 use anyhow::Context;
-use glsl_lang::ast::{FunctionDefinition, FunctionPrototype};
-use glsl_lang::parse::DefaultParse;
+use glsl_lang::ast;
 use shaderc::{CompileOptions, Compiler, OptimizationLevel, SourceLanguage, TargetEnv};
 
 use crate::proot;
-use crate::tree::{NAryFunction, Node};
+use crate::tree;
+use crate::tree::NAryFunction;
 
 pub struct DynamicEvaluator<'a> {
     compiler: Compiler,
@@ -35,7 +35,7 @@ enum BuiltinGlslFunction {
 
 #[derive(Debug, Clone, PartialEq)]
 struct GlslNonOperatorFunction {
-    prototype: FunctionPrototype,
+    prototype: ast::FunctionPrototype,
 }
 
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
@@ -61,12 +61,12 @@ enum GlslBinaryOperator {
 struct CustomGlslFunction {
     id: usize,
     arity: usize,
-    ast: FunctionDefinition,
+    ast: ast::FunctionDefinition,
 }
 
 #[derive(Debug, Clone)]
 struct CustomGlslFunctionDefinition {
-    ast: FunctionDefinition,
+    ast: ast::FunctionDefinition,
 }
 
 impl NAryFunction for BuiltinGlslFunction {
@@ -115,7 +115,7 @@ impl NAryFunction for GlslBinaryOperator {
     }
 }
 
-impl From<GlslUnaryOperator> for glsl_lang::ast::UnaryOp {
+impl From<GlslUnaryOperator> for ast::UnaryOp {
     fn from(value: GlslUnaryOperator) -> Self {
         use glsl_lang::ast::*;
         match value {
@@ -124,10 +124,10 @@ impl From<GlslUnaryOperator> for glsl_lang::ast::UnaryOp {
     }
 }
 
-impl TryFrom<glsl_lang::ast::UnaryOpData> for GlslUnaryOperator {
+impl TryFrom<ast::UnaryOpData> for GlslUnaryOperator {
     type Error = ();
 
-    fn try_from(value: glsl_lang::ast::UnaryOpData) -> Result<Self, Self::Error> {
+    fn try_from(value: ast::UnaryOpData) -> Result<Self, Self::Error> {
         use glsl_lang::ast::*;
         Ok(match value {
             | UnaryOpData::Minus => Self::Neg,
@@ -136,7 +136,7 @@ impl TryFrom<glsl_lang::ast::UnaryOpData> for GlslUnaryOperator {
     }
 }
 
-impl From<GlslBinaryOperator> for glsl_lang::ast::BinaryOpData {
+impl From<GlslBinaryOperator> for ast::BinaryOpData {
     fn from(value: GlslBinaryOperator) -> Self {
         use glsl_lang::ast::*;
         match value {
@@ -193,14 +193,14 @@ impl PartialEq for CustomGlslFunction {
 
 impl Eq for CustomGlslFunction {}
 
-impl NAryFunction for CustomGlslFunction {
+impl tree::NAryFunction for CustomGlslFunction {
     fn arity(&self) -> usize {
         debug_assert_eq!(self.arity, self.ast.prototype.parameters.len());
         self.arity
     }
 }
 
-impl NAryFunction for CustomGlslFunctionDefinition {
+impl tree::NAryFunction for CustomGlslFunctionDefinition {
     fn arity(&self) -> usize {
         self.ast.prototype.parameters.len()
     }
@@ -214,7 +214,12 @@ impl<'a> DynamicEvaluator<'a> {
     const USER_FUNCTION_DEFINITIONS_PATH: &'static str = "user-function-definitions";
     const EVAL_FUNCTION_DEFINITION_PATH: &'static str = "eval-function-definition";
 
+    const PREFACTOR_FUNCTION_IDENTIFIER: &'static str = "_prefactor";
+    const SAMPLE_FUNCTION_IDENTIFIER: &'static str = "_sample";
     const EVAL_FUNCTION_IDENTIFIER: &'static str = "_eval";
+    const BATCH_IDX_IDENTIFIER: &'static str = "batchIdx";
+    const PERMUTATION_IDX_IDENTIFIER: &'static str = "permutationIdx";
+    const DIMENSION_IDENTIFIER: &'static str = "dimension";
     const LOCAL_SIZE_X_MACRO_IDENTIFIER: &'static str = "LOCAL_SIZE_X";
     const LOCAL_SIZE_Y_MACRO_IDENTIFIER: &'static str = "LOCAL_SIZE_Y";
 
@@ -254,14 +259,113 @@ impl<'a> DynamicEvaluator<'a> {
             .collect::<BTreeMap<gpu::Function, GlslFunction>>()
     }
 
-    fn generate_eval_expr_ast(
-        tree: &Node<f32, crate::ops::gpu::Function>,
-        operators: &impl Index<crate::ops::gpu::Function, Output = GlslFunction>,
-    ) -> glsl_lang::ast::Expr {
-        todo!()
+    fn generate_eval_expr_ast<
+        I: for<'b> Index<&'b crate::ops::gpu::Function, Output = GlslFunction>,
+    >(
+        tree: &tree::Node<f32, crate::ops::gpu::Function>,
+        operators: &I,
+    ) -> ast::Expr {
+        use ast::*;
+        fn generate_constant_ast(
+            tree::Constant { value }: &tree::Constant<f32>,
+        ) -> ExprData {
+            ExprData::FloatConst(*value)
+        }
+
+        fn generate_variable_ast(
+            tree::Variable { id, .. }: &tree::Variable<f32>,
+        ) -> ExprData {
+            ExprData::FunCall(
+                FunIdentifier::new(
+                    FunIdentifierData::Expr(
+                        Expr::new(
+                            ExprData::Variable(Identifier::new(
+                                IdentifierData::from(
+                                    DynamicEvaluator::SAMPLE_FUNCTION_IDENTIFIER,
+                                ),
+                                None,
+                            )),
+                            None,
+                        )
+                        .into(),
+                    ),
+                    None,
+                ),
+                vec![
+                    Expr::new(
+                        ExprData::Variable(Identifier::new(
+                            IdentifierData::from(DynamicEvaluator::BATCH_IDX_IDENTIFIER),
+                            None,
+                        )),
+                        None,
+                    ),
+                    Expr::new(
+                        ExprData::Variable(Identifier::new(
+                            IdentifierData::from(id.to_string().as_str()),
+                            None,
+                        )),
+                        None,
+                    ),
+                ],
+            )
+        }
+
+        fn generate_function_ast<
+            I: for<'b> Index<&'b crate::ops::gpu::Function, Output = GlslFunction>,
+        >(
+            tree::Function { function, operands }: &tree::Function<
+                f32,
+                crate::ops::gpu::Function,
+            >,
+            operators: &I,
+        ) -> ExprData {
+            let glsl_function = &operators[function];
+
+            ExprData::FunCall(todo!(), todo!());
+            todo!()
+        }
+
+        let subtree = Expr::new(
+            match tree {
+                | tree::Node::Constant(constant) => generate_constant_ast(constant),
+                | tree::Node::Variable(variable) => generate_variable_ast(variable),
+                | tree::Node::Function(function) => {
+                    generate_function_ast(function, operators)
+                }
+            },
+            None,
+        );
+
+        let prefactor = Expr::new(
+            ExprData::FunCall(
+                FunIdentifier::new(
+                    FunIdentifierData::Expr(
+                        Expr::new(
+                            ExprData::Variable(Identifier::new(
+                                IdentifierData::from(Self::PREFACTOR_FUNCTION_IDENTIFIER),
+                                None,
+                            )),
+                            None,
+                        )
+                        .into(),
+                    ),
+                    None,
+                ),
+                vec![],
+            ),
+            None,
+        );
+
+        Expr::new(
+            ExprData::Binary(
+                BinaryOp::new(BinaryOpData::Mult, None),
+                prefactor.into(),
+                subtree.into(),
+            ),
+            None,
+        )
     }
 }
-
 #[cfg(test)]
 mod tests {
     use glsl_lang::ast;
@@ -281,13 +385,16 @@ mod tests {
         use glsl_lang::transpiler::glsl::*;
 
         let source = r"
+            void foo(void) {}
             float mul(float a, float b) {
-                float result = a * b;
+                foo();
+                float result = (a * b);
+                result = (1 + 2) * 3;
                 return result;
             }";
 
         let ast = ast::TranslationUnit::parse(source)?;
-
+        dbg!(&ast);
         let mut rendered = String::new();
         show_translation_unit(&mut rendered, &ast, FormattingState::default())?;
 
