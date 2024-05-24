@@ -172,6 +172,7 @@ float _eval(uint batchIdx, uint permutationIdx, uint treeSize) {
                 break;
         }
         stack[sp] = _prefactor(permutationIdx, tp) * result;
+        sp += 1;
     }
     return stack[sp];
 }
