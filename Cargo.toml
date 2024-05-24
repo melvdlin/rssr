@@ -19,3 +19,4 @@ glsl-lang = { version = "0.5.2", features = ["lexer-v2-full"] }
 itertools = "0.13.0"
 rayon = "1.10.0"
 shaderc = "0.8.3"
+wgpu = { version = "0.20.0", features = ["glsl"] }

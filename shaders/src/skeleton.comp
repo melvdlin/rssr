@@ -54,18 +54,18 @@ layout (std140, set = 0, binding = 2) readonly buffer ConstantPool {
 
 // a set of indices into the preimage; batch size == number of summands in MSD per permutation
 layout (std140, set = 0, binding = 3) readonly buffer Batch {
-    // size == BATCH_SIZE
+// size == BATCH_SIZE
     uint batch[];
 };
 
 // prefactors to multiply a tree node by; one per node
 layout (std140, set = 0, binding = 4) readonly buffer PermutationPrefactors {
-    // size == PERMUTATIONS * expressionSize
+// size == PERMUTATIONS * expressionSize
     uint permutationPrefactors[];
 };
 
 layout (std140, set = 0, binding = 5) buffer SquaredDeviations {
-    // size == BATCH_SIZE * PERMUTATIONS
+// size == BATCH_SIZE * PERMUTATIONS
     float squaredDeviations[];
 };
 
@@ -98,7 +98,7 @@ struct TreeNode {
 };
 
 layout (std140, set = 0, binding = 6) readonly buffer Tree {
-    // must contain exactly `expressionSize` elements
+// must contain exactly `expressionSize` elements
     TreeNode tree[];
 };
 
@@ -145,31 +145,31 @@ float _sample(uint batchIdx, uint dimension) {
 float _eval(uint batchIdx, uint permutationIdx, uint treeSize) {
     float stack[STACK_SIZE];
     uint sp = 0;
-    for (int tp = treeSize; tp >= 0; tp -= 1) {
+    for (int tp = int(treeSize); tp >= 0; tp -= 1) {
         TreeNode node = tree[tp];
         float result = 0.0;
         uint arity = node.immediate;
         switch (node.opkind) {
             case OPKIND_VARIABLE:
-                uint dimension = node.immediate;
-                result = _sample(batchIdx, dimension);
-                break;
+            uint dimension = node.immediate;
+            result = _sample(batchIdx, dimension);
+            break;
             case OPKIND_CONSTANT:
-                uint constantIdx = node.immediate;
-                result = constants[constantIdx];
-                break;
+            uint constantIdx = node.immediate;
+            result = constants[constantIdx];
+            break;
             case OPKIND_BUILTIN_OPERATOR:
-                result = _builtinOperator(node.functionID, sp, stack);
-                sp -= arity;
-                break;
+            result = _builtinOperator(node.functionID, sp, stack);
+            sp -= arity;
+            break;
             case OPKIND_BUILTIN_FUNCTION:
-                result = _builtinFunction(node.functionID, sp, stack);
-                sp -= arity;
-                break;
+            result = _builtinFunction(node.functionID, sp, stack);
+            sp -= arity;
+            break;
             case OPKIND_CUSTOM_FUNCTION:
-                result = _customFunction(node.functionID, sp, stack);
-                sp -= arity;
-                break;
+            result = _customFunction(node.functionID, sp, stack);
+            sp -= arity;
+            break;
         }
         stack[sp] = _prefactor(permutationIdx, tp) * result;
         sp += 1;
@@ -183,7 +183,7 @@ float _builtinOperator(uint opID, uint stack[STACK_SIZE]) {
         case OPID_SUBTRACT: return stack[sp - 1] - stack[sp - 2];
         case OPID_MULTIPLY: return stack[sp - 1] * stack[sp - 2];
         case OPID_NEGATE: return -1.0 * stack[sp - 1];
-        default: return 0.0;
+        default : return 0.0;
     }
 }
 
