@@ -14,11 +14,12 @@ impl<T: Clone> Evaluator<T, cpu::Function<T>> for SingleThreadedEvaluator {
         &mut self,
         tree: &Node<T, cpu::Function<T>>,
         variables: &[T],
+        constants: &[T],
     ) -> Result<Self::R, Self::E> {
         match tree {
-            | Node::Constant(crate::tree::Constant { value }) => {
+            | Node::Constant(crate::tree::Constant { id, .. }) => {
                 debug_assert!(variables.is_empty());
-                Ok(value.clone())
+                Ok(constants[*id].clone())
             }
             | Node::Variable(crate::tree::Variable { id, .. }) => {
                 Ok(variables[*id].clone())
@@ -27,7 +28,7 @@ impl<T: Clone> Evaluator<T, cpu::Function<T>> for SingleThreadedEvaluator {
                 Ok(function.apply(
                     operands
                         .iter()
-                        .map(|node| self.evaluate(node, variables))
+                        .map(|node| self.evaluate(node, variables, constants))
                         .collect::<Result<Vec<_>, _>>()?
                         .as_slice(),
                 ))
@@ -46,8 +47,8 @@ mod tests {
         Node::Function(Function::new(
             cpu::Function::new(2, |operands| operands.iter().sum()),
             [
-                Node::Constant(Constant::new(1f64)),
-                Node::Constant(Constant::new(2f64)),
+                Node::Constant(Constant::new(0)),
+                Node::Constant(Constant::new(1)),
             ]
             .as_slice(),
         ))
@@ -69,7 +70,9 @@ mod tests {
         let tree = simple_tree();
         assert_abs_diff_eq!(
             3.0,
-            SingleThreadedEvaluator.evaluate(&tree, &[],).unwrap(),
+            SingleThreadedEvaluator
+                .evaluate(&tree, &[], &[1.0, 2.0])
+                .unwrap(),
             epsilon = f64::EPSILON
         );
     }
@@ -81,7 +84,7 @@ mod tests {
         assert_abs_diff_eq!(
             3.0,
             SingleThreadedEvaluator
-                .evaluate(&tree, &[1.0, 2.0])
+                .evaluate(&tree, &[1.0, 2.0], &[])
                 .unwrap(),
             epsilon = f64::EPSILON
         );

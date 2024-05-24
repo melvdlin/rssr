@@ -267,9 +267,9 @@ impl<'a> DynamicEvaluator<'a> {
     ) -> ast::Expr {
         use ast::*;
         fn generate_constant_ast(
-            tree::Constant { value }: &tree::Constant<f32>,
+            tree::Constant { id, .. }: &tree::Constant<f32>,
         ) -> ExprData {
-            ExprData::FloatConst(*value)
+            ExprData::FloatConst(todo!())
         }
 
         fn generate_variable_ast(

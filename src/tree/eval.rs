@@ -10,5 +10,6 @@ pub trait Evaluator<T, F> {
         &mut self,
         tree: &Node<T, F>,
         variables: &[T],
+        constants: &[T],
     ) -> Result<Self::R, Self::E>;
 }

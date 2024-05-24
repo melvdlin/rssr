@@ -11,7 +11,8 @@ pub enum Node<T, F> {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct Constant<T> {
-    value: T,
+    id: usize,
+    _phantom: PhantomData<T>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
@@ -49,8 +50,11 @@ impl<T: Clone, F: NAryFunction> Tree for Node<T, F> {
 }
 
 impl<T> Constant<T> {
-    pub fn new(value: T) -> Self {
-        Self { value }
+    pub fn new(id: usize) -> Self {
+        Self {
+            id,
+            _phantom: PhantomData,
+        }
     }
 }
 
