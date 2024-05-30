@@ -10,34 +10,18 @@
     OPKINDs: uint literals
     - OPKIND_VARIABLE
     - OPKIND_CONSTANT
-    - OPKIND_BUILTIN_OPERATOR
-    - OPKIND_BUILTIN_FUNCTION
-    - OPKIND_CUSTOM_FUNCTION
-
-    OPIDs: uint literals
-    - OPID_ADD
-    - OPID_SUBTRACT
-    - OPID_MULTIPLY
-    - OPID_DIVIDE
-    - OPID_NEGATE
-
+    - OPKIND_FUNCTION
 
     required #includes:
 
-        builtin-function-evaluation:
+        function-evaluation:
         must define a function definition of prototype
-        `float _builtinFunction(uint functionID, uint sp, uint stack[STACK_SIZE]);`
-        that translates the `functionID` into a builtin function call
+        `_functionXYZ(uint functionID, uint sp, uint stack[STACK_SIZE])`
+        that translates the `functionID` into a function call
         using the operands on the stack
 
-        custom-function-evaluation:
-        must define a function definition of prototype
-        `_customFunction(uint functionID, uint sp, uint stack[STACK_SIZE])`
-        that translates the `functionID` into a custom function call
-        using the operands on the stack
-
-        custom-function-definitions:
-        must contain definitions of the functions used in custom-function-evaluation.
+        function-definitions:
+        must contain definitions of the functions used in function-evaluation.
 */
 
 layout (std140, set = 0, binding = 0) readonly buffer Preimage {
@@ -71,24 +55,12 @@ layout (std140, set = 0, binding = 5) buffer SquaredDeviations {
 
 /*
 
-| opkind                  | immediate        | functionID          |
-| ----------------------- | ---------------- | ------------------- |
-| OPKIND_VARIABLE         | dimension        | unused              |
-| OPKIND_CONSTANT         | pool index       | unused              |
-| OPKIND_BUILTIN_OPERATOR | arity            | builtin operator ID |
-| OPKIND_BUILTIN_FUNCTION | arity            | builtin function ID |
-| OPKIND_CUSTOM_FUNCTION  | arity            | custom function ID  |
+| opkind          | immediate  | functionID  |
+| ----------------| ---------- | ------------|
+| OPKIND_VARIABLE | dimension  | unused      |
+| OPKIND_CONSTANT | pool index | unused      |
+| OPKIND_FUNCTION | arity      | function ID |
 
-
-builtin operators:
-
-| opID     | arity |
-| -------- | ----- |
-| ADD      |     2 |
-| SUBTRACT |     2 |
-| MULTIPLY |     2 |
-| DIVIDE   |     2 |
-| NEGATE   |     1 |
 
 */
 struct TreeNode {
@@ -113,9 +85,7 @@ layout (local_size_x = BATCH_SIZE, local_size_y = PERMUTATIONS, local_size_z = 1
 uint _prefactor(uint permutationIdx, uint nodeIdx);
 float _sample(uint batchIdx, uint dimension);
 float _eval(uint batchIdx, uint permutationIdx, uint expressionSize);
-float _builtinOperator(uint opID, uint sp, uint stack[STACK_SIZE]);
-float _builtinFunction(uint functionID, uint sp, uint stack[STACK_SIZE]);
-float _customFunction(uint functionID, uint sp, uint stack[STACK_SIZE]);
+float _function(uint functionID, uint sp, uint stack[STACK_SIZE]);
 
 
 void main() {
@@ -140,7 +110,7 @@ float _sample(uint batchIdx, uint dimension) {
     return preimage[batch[batchIdx] * preimageDimensions + dimension];
 }
 
-#include "custom-function-definitions"
+#include "function-definitions"
 
 float _eval(uint batchIdx, uint permutationIdx, uint treeSize) {
     float stack[STACK_SIZE];
@@ -167,7 +137,7 @@ float _eval(uint batchIdx, uint permutationIdx, uint treeSize) {
             sp -= arity;
             break;
             case OPKIND_CUSTOM_FUNCTION:
-            result = _customFunction(node.functionID, sp, stack);
+            result = _function(node.functionID, sp, stack);
             sp -= arity;
             break;
         }
@@ -176,16 +146,15 @@ float _eval(uint batchIdx, uint permutationIdx, uint treeSize) {
     }
     return stack[sp];
 }
+//
+//float _builtinOperator(uint opID, uint stack[STACK_SIZE]) {
+//    switch (opID) {
+//        case OPID_ADD: return stack[sp - 1] + stack[sp - 2];
+//        case OPID_SUBTRACT: return stack[sp - 1] - stack[sp - 2];
+//        case OPID_MULTIPLY: return stack[sp - 1] * stack[sp - 2];
+//        case OPID_NEGATE: return -1.0 * stack[sp - 1];
+//        default : return 0.0;
+//    }
+//}
 
-float _builtinOperator(uint opID, uint stack[STACK_SIZE]) {
-    switch (opID) {
-        case OPID_ADD: return stack[sp - 1] + stack[sp - 2];
-        case OPID_SUBTRACT: return stack[sp - 1] - stack[sp - 2];
-        case OPID_MULTIPLY: return stack[sp - 1] * stack[sp - 2];
-        case OPID_NEGATE: return -1.0 * stack[sp - 1];
-        default : return 0.0;
-    }
-}
-
-#include "builtin-function-evaluation"
-#include "custom-function-evaluation"
+#include "function-evaluation"
