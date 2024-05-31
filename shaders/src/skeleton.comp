@@ -12,16 +12,14 @@
     - OPKIND_CONSTANT
     - OPKIND_FUNCTION
 
-    required #includes:
-
-        function-evaluation:
+    FUNCTION_EVALUATION:
         must define a function definition
         of prototype `float _function(uint id, uint sp, float stack[STACK_SIZE])`
         that translates the `functionID` into a function (
         of prototype `float _functionXYZ(float p1, float p2, ..., float pn)`
         ) call using the operands on the stack
 
-        function-definitions:
+    FUNCTION_DEFINITIONS:
         must contain definitions of the functions used in function-evaluation.
 */
 
@@ -111,7 +109,7 @@ float _sample(uint batchIdx, uint dimension) {
     return preimage[batch[batchIdx] * preimageDimensions + dimension];
 }
 
-#include "function-definitions"
+FUNCTION_DEFINITIONS
 
 float _eval(uint batchIdx, uint permutationIdx, uint treeSize) {
     float stack[STACK_SIZE];
@@ -150,4 +148,4 @@ float _eval(uint batchIdx, uint permutationIdx, uint treeSize) {
 //    }
 //}
 
-#include "function-evaluation"
+FUNCTION_EVALUATION

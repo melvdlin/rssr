@@ -1,12 +1,12 @@
+use std::fmt::Formatter;
+use std::io::Read;
+
 use anyhow::Context;
 use glsl_lang::ast::{NodeContent, SmolStr};
-use itertools::multiunzip;
 use shaderc::{
     CompileOptions, Compiler, OptimizationLevel, ShaderKind, SourceLanguage, TargetEnv,
 };
-use std::fmt::Formatter;
-use std::io::Read;
-use wgpu::naga::{FastHashMap, Statement};
+use wgpu::naga::FastHashMap;
 
 pub struct StaticEvaluator {
     functions: FastHashMap<usize, crate::ops::gpu::Function>,
@@ -26,42 +26,68 @@ pub enum FunctionSanitizeError {
 }
 
 mod macro_identifiers {
-    mod opkind {
-        const PREFIX: &str = "OPKIND";
-        const VARIABLE: &str = "OPKIND_VARIABLE";
-        const CONSTANT: &str = "OPKIND_CONSTANT";
-        const BUILTIN_OPERATOR: &str = "OPKIND_BUILTIN_OPERATOR";
-        const BUILTIN_FUNCTION: &str = "OPKIND_CUSTOM_FUNCTION";
+    pub mod opkind {
+        pub const VARIABLE: &str = "OPKIND_VARIABLE";
+        pub const CONSTANT: &str = "OPKIND_CONSTANT";
+        pub const FUNCTION: &str = "OPKIND_FUNCTION";
     }
-    const BATCH_SIZE: &str = "BATCH_SIZE";
-    const PERMUTATIONS: &str = "PERMUTATIONS";
-    const STACK_SIZE: &str = "STACK_SIZE";
+    pub const BATCH_SIZE: &str = "BATCH_SIZE";
+    pub const PERMUTATIONS: &str = "PERMUTATIONS";
+    pub const STACK_SIZE: &str = "STACK_SIZE";
+    pub const FUNCTION_EVALUATION: &str = "FUNCTION_EVALUATION";
+    pub const FUNCTION_DEFINITIONS: &str = "FUNCTION_DEFINITIONS";
 }
 
 impl StaticEvaluator {
-    const SHADER_SOURCE: &'static str = "";
-    const DISPATCH_MACRO_IDENTIFIER: &'static str = "DISPATCH";
-    const OPERATORS_MACRO_IDENTIFIER: &'static str = "OPERATORS";
+    const SHADER_SOURCE: &'static str =
+        include_str!(crate::proot!("shaders/src/skeleton.comp"));
 
-    pub fn new(operators: &[crate::ops::gpu::Function]) -> anyhow::Result<Self> {
-        let compiler =
-            Compiler::new().with_context(|| "Failed to initialise SPIRV compiler")?;
+    pub fn new(
+        functions: impl IntoIterator<Item = glsl_lang::ast::FunctionDefinition>,
+        batch_size: usize,
+        permutations: usize,
+        stack_size: usize,
+        opkind_variable: usize,
+        opkind_constant: usize,
+        opkind_function: usize,
+    ) -> anyhow::Result<Self> {
+        let compiler = Compiler::new().context("Failed to initialise SPIRV compiler")?;
         let mut options = CompileOptions::new()
-            .with_context(|| "Failed to initialise SPIRV compile options")?;
+            .context("Failed to initialise SPIRV compile options")?;
 
         options.set_target_env(TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_3 as u32);
         options.set_generate_debug_info();
         options.set_optimization_level(OptimizationLevel::Performance);
         options.set_source_language(SourceLanguage::GLSL);
+        options.add_macro_definition(
+            macro_identifiers::opkind::VARIABLE,
+            Some(&opkind_variable.to_string()),
+        );
+        options.add_macro_definition(
+            macro_identifiers::opkind::CONSTANT,
+            Some(&opkind_constant.to_string()),
+        );
+        options.add_macro_definition(
+            macro_identifiers::opkind::FUNCTION,
+            Some(&opkind_function.to_string()),
+        );
+        options.add_macro_definition(
+            macro_identifiers::BATCH_SIZE,
+            Some(&batch_size.to_string()),
+        );
+        options.add_macro_definition(
+            macro_identifiers::PERMUTATIONS,
+            Some(&permutations.to_string()),
+        );
+        options.add_macro_definition(
+            macro_identifiers::STACK_SIZE,
+            Some(&stack_size.to_string()),
+        );
 
-        options.add_macro_definition(
-            Self::DISPATCH_MACRO_IDENTIFIER,
-            Some(&Self::generate_dispatcher()),
-        );
-        options.add_macro_definition(
-            Self::OPERATORS_MACRO_IDENTIFIER,
-            Some(&Self::generate_operators()),
-        );
+        let sanitized = Self::sanitize_function_definitions(functions)
+            .context("Failed to sanitize functions")?;
+
+        let evaluation = todo!();
 
         let artifact = compiler.compile_into_spirv(
             Self::SHADER_SOURCE,
