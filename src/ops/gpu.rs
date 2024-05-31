@@ -3,8 +3,8 @@ use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub struct Function {
-    id: usize,
-    arity: usize,
+    pub id: usize,
+    pub arity: usize,
 }
 
 impl Function {

@@ -15,10 +15,11 @@
     required #includes:
 
         function-evaluation:
-        must define a function definition of prototype
-        `_functionXYZ(uint functionID, uint sp, uint stack[STACK_SIZE])`
-        that translates the `functionID` into a function call
-        using the operands on the stack
+        must define a function definition
+        of prototype `float _function(uint id, uint sp, float stack[STACK_SIZE])`
+        that translates the `functionID` into a function (
+        of prototype `float _functionXYZ(float p1, float p2, ..., float pn)`
+        ) call using the operands on the stack
 
         function-definitions:
         must contain definitions of the functions used in function-evaluation.
@@ -128,15 +129,7 @@ float _eval(uint batchIdx, uint permutationIdx, uint treeSize) {
             uint constantIdx = node.immediate;
             result = constants[constantIdx];
             break;
-            case OPKIND_BUILTIN_OPERATOR:
-            result = _builtinOperator(node.functionID, sp, stack);
-            sp -= arity;
-            break;
-            case OPKIND_BUILTIN_FUNCTION:
-            result = _builtinFunction(node.functionID, sp, stack);
-            sp -= arity;
-            break;
-            case OPKIND_CUSTOM_FUNCTION:
+            case OPKIND_FUNCTION:
             result = _function(node.functionID, sp, stack);
             sp -= arity;
             break;
@@ -147,7 +140,7 @@ float _eval(uint batchIdx, uint permutationIdx, uint treeSize) {
     return stack[sp];
 }
 //
-//float _builtinOperator(uint opID, uint stack[STACK_SIZE]) {
+//float _builtinOperator(uint opID, uint sp, float stack[STACK_SIZE]) {
 //    switch (opID) {
 //        case OPID_ADD: return stack[sp - 1] + stack[sp - 2];
 //        case OPID_SUBTRACT: return stack[sp - 1] - stack[sp - 2];

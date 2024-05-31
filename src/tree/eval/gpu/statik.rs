@@ -1,10 +1,12 @@
 use anyhow::Context;
-use glsl_lang::ast::SmolStr;
+use glsl_lang::ast::{NodeContent, SmolStr};
+use itertools::multiunzip;
 use shaderc::{
     CompileOptions, Compiler, OptimizationLevel, ShaderKind, SourceLanguage, TargetEnv,
 };
 use std::fmt::Formatter;
-use wgpu::naga::FastHashMap;
+use std::io::Read;
+use wgpu::naga::{FastHashMap, Statement};
 
 pub struct StaticEvaluator {
     functions: FastHashMap<usize, crate::ops::gpu::Function>,
@@ -95,22 +97,18 @@ impl StaticEvaluator {
                 )
             {
                 return Err(FunctionSanitizeError::InvalidReturnType {
-                    expected: FullySpecifiedType::new(
-                        FullySpecifiedTypeData {
-                            qualifier: None,
-                            ty: TypeSpecifier::new(
-                                TypeSpecifierData {
-                                    ty: TypeSpecifierNonArray::new(
-                                        TypeSpecifierNonArrayData::Float,
-                                        None,
-                                    ),
-                                    array_specifier: None,
-                                },
+                    expected: FullySpecifiedTypeData {
+                        qualifier: None,
+                        ty: TypeSpecifierData {
+                            ty: TypeSpecifierNonArray::new(
+                                TypeSpecifierNonArrayData::Float,
                                 None,
                             ),
-                        },
-                        None,
-                    ),
+                            array_specifier: None,
+                        }
+                        .into(),
+                    }
+                    .into(),
                     found: function.prototype.ty.clone(),
                 });
             }
@@ -175,7 +173,7 @@ impl StaticEvaluator {
                 }
                 let arity = function.prototype.parameters.len();
                 let op = crate::ops::gpu::Function::new(id, arity);
-                let mut ident = Self::generate_function_name(id).into();
+                let mut ident = Self::generate_function_name(id);
                 std::mem::swap(&mut function.prototype.name.0, &mut ident);
 
                 Ok((function, op, ident))
@@ -185,20 +183,188 @@ impl StaticEvaluator {
 
     fn generate_function_evaluation(
         functions: impl IntoIterator<Item = crate::ops::gpu::Function>,
+        stack_size: usize,
     ) -> glsl_lang::ast::FunctionDefinition {
-        todo!()
+        use glsl_lang::ast::*;
+
+        fn parameter_declaration(
+            ident: Identifier,
+            ty: TypeSpecifierNonArrayData,
+            array: Option<ArraySpecifierData>,
+        ) -> FunctionParameterDeclaration {
+            FunctionParameterDeclarationData::Named(
+                None,
+                FunctionParameterDeclaratorData {
+                    ty: TypeSpecifierData {
+                        ty: ty.into_node(),
+                        array_specifier: None,
+                    }
+                    .into_node(),
+                    ident: ArrayedIdentifierData {
+                        ident,
+                        array_spec: array.map(Node::from),
+                    }
+                    .into_node(),
+                }
+                .into_node(),
+            )
+            .into_node()
+        }
+
+        // prototype:
+        // `float _function(uint id, uint sp, float stack[STACK_SIZE])`
+        // functions to call:
+        // `float _functionXYZ(float p1, float p2, ..., float pn)`
+
+        let function_ident = IdentifierData::from("_function").into_node();
+        let id_param_ident: Identifier = IdentifierData::from("id").into_node();
+        let sp_param_ident: Identifier = IdentifierData::from("sp").into_node();
+        let stack_param_ident: Identifier = IdentifierData::from("stack").into_node();
+        let id_param = parameter_declaration(
+            id_param_ident.clone(),
+            TypeSpecifierNonArrayData::UInt,
+            None,
+        );
+        let sp_param = parameter_declaration(
+            sp_param_ident.clone(),
+            TypeSpecifierNonArrayData::UInt,
+            None,
+        );
+
+        let stack_param = parameter_declaration(
+            stack_param_ident.clone(),
+            TypeSpecifierNonArrayData::Float,
+            Some(ArraySpecifierData {
+                dimensions: vec![ArraySpecifierDimensionData::ExplicitlySized(Box::new(
+                    ExprData::UIntConst(stack_size as u32).into_node(),
+                ))
+                .into_node()],
+            }),
+        );
+
+        let prototype = FunctionPrototypeData {
+            ty: FullySpecifiedTypeData {
+                qualifier: None,
+                ty: TypeSpecifierData {
+                    ty: TypeSpecifierNonArrayData::Float.into_node(),
+                    array_specifier: None,
+                }
+                .into(),
+            }
+            .into(),
+            name: function_ident,
+            parameters: vec![id_param, sp_param, stack_param],
+        };
+
+        let switch: Statement = StatementData::Switch(
+            SwitchStatementData {
+                head: Box::new(ExprData::variable(id_param_ident).into_node()),
+                body: functions
+                    .into_iter()
+                    .map(|function| {
+                        let id = function.id;
+                        let arity = function.arity as u32;
+                        let ident =
+                            IdentifierData(Self::generate_function_name(id)).into_node();
+
+                        let label = StatementData::CaseLabel(
+                            CaseLabelData::Case(Box::new(
+                                ExprData::UIntConst(id as u32).into_node(),
+                            ))
+                            .into_node(),
+                        )
+                        .into_node();
+
+                        let ret = StatementData::Jump(
+                            JumpStatementData::Return(Some(Box::new(
+                                ExprData::FunCall(
+                                    FunIdentifierData::Expr(Box::new(
+                                        ExprData::variable(ident).into_node(),
+                                    ))
+                                    .into_node(),
+                                    (1..=arity)
+                                        .map(|offset| {
+                                            ExprData::Bracket(
+                                                Box::new(
+                                                    ExprData::variable(
+                                                        stack_param_ident.clone(),
+                                                    )
+                                                    .into_node(),
+                                                ),
+                                                Box::new(
+                                                    ExprData::Binary(
+                                                        BinaryOpData::Sub.into_node(),
+                                                        Box::new(
+                                                            ExprData::variable(
+                                                                sp_param_ident.clone(),
+                                                            )
+                                                            .into_node(),
+                                                        ),
+                                                        Box::new(
+                                                            ExprData::UIntConst(offset)
+                                                                .into_node(),
+                                                        ),
+                                                    )
+                                                    .into_node(),
+                                                ),
+                                            )
+                                            .into_node()
+                                        })
+                                        .collect(),
+                                )
+                                .into_node(),
+                            )))
+                            .into_node(),
+                        )
+                        .into_node();
+
+                        StatementData::Compound(
+                            CompoundStatementData {
+                                statement_list: vec![label, ret],
+                            }
+                            .into_node(),
+                        )
+                        .into_node()
+                    })
+                    .chain(std::iter::once({
+                        let label =
+                            StatementData::CaseLabel(CaseLabelData::Def.into_node())
+                                .into_node();
+
+                        let ret = StatementData::Jump(
+                            JumpStatementData::Return(Some(Box::new(
+                                ExprData::FloatConst(0.0).into_node(),
+                            )))
+                            .into_node(),
+                        )
+                        .into_node();
+
+                        StatementData::Compound(
+                            CompoundStatementData {
+                                statement_list: vec![label, ret],
+                            }
+                            .into_node(),
+                        )
+                        .into_node()
+                    }))
+                    .collect(),
+            }
+            .into_node(),
+        )
+        .into_node();
+
+        FunctionDefinitionData {
+            prototype: prototype.into_node(),
+            statement: CompoundStatementData {
+                statement_list: vec![switch],
+            }
+            .into_node(),
+        }
+        .into_node()
     }
 
-    fn generate_function_name(id: usize) -> String {
-        format!("_function{id}")
-    }
-
-    fn generate_dispatcher() -> String {
-        todo!()
-    }
-
-    fn generate_operators() -> String {
-        todo!()
+    fn generate_function_name(id: usize) -> SmolStr {
+        format!("_function{id}").into()
     }
 }
 
