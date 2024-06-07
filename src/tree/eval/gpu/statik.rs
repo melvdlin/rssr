@@ -1,18 +1,27 @@
+use std::borrow::Cow;
 use std::fmt::Formatter;
 
 use glsl_lang::ast::{FunctionDefinition, SmolStr};
-use shaderc::{
-    CompilationArtifact, CompileOptions, Compiler, OptimizationLevel, ShaderKind,
-    SourceLanguage, TargetEnv,
-};
+use itertools::Itertools;
+use nalgebra::DMatrix;
 use wgpu::naga::FastHashMap;
 
 pub struct StaticEvaluator {
     functions: FastHashMap<usize, crate::ops::gpu::Function>,
     function_names: FastHashMap<crate::ops::gpu::Function, SmolStr>,
-    shader_artifact: CompilationArtifact,
-    preimage: nalgebra::DMatrix<f32>,
+    wgpu_state: WgpuState,
+    preimage: DMatrix<f32>,
     image: Box<[f32]>,
+    constant_pool_size: usize,
+}
+
+struct WgpuState {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    write_stage: wgpu::Buffer,
+    read_stage: wgpu::Buffer,
+    storage: wgpu::Buffer,
+    pipeline: wgpu::ComputePipeline,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -35,8 +44,12 @@ pub enum StaticEvaluatorError {
     },
     #[error("shaderc error")]
     ShaderC(#[from] Option<shaderc::Error>),
-    #[error("{0}")]
+    #[error("naga error: {0}")]
+    Naga(#[from] naga::front::glsl::ParseError),
+    #[error("failed to sanitize functions: {0}")]
     FunctionSanitize(#[from] FunctionSanitizeError),
+    #[error("WGPU error: {0}")]
+    Wgpu(SmolStr),
 }
 
 #[derive(Clone, Debug)]
@@ -115,12 +128,13 @@ impl StaticEvaluator {
         include_str!(crate::proot!("shaders/src/skeleton.comp"));
 
     pub fn new(
-        functions: impl IntoIterator<Item = glsl_lang::ast::FunctionDefinition>,
+        functions: impl IntoIterator<Item = FunctionDefinition>,
         batch_size: usize,
         permutations: usize,
         stack_size: usize,
-        preimage: nalgebra::DMatrix<f32>,
-        image: &[f32],
+        constant_pool_size: usize,
+        preimage: DMatrix<f32>,
+        image: Box<[f32]>,
     ) -> Result<Self, StaticEvaluatorError> {
         if preimage.nrows() != image.len() {
             return Err(StaticEvaluatorError::Dataset {
@@ -136,16 +150,28 @@ impl StaticEvaluator {
             });
         }
 
-        let (function_names, artifact) =
+        let (function_names, shader, wg_size) =
             Self::generate_shader(functions, batch_size, permutations, stack_size)?;
+        assert_eq!(wg_size, [batch_size as u32, permutations as u32, 0]);
         let functions = function_names.keys().map(|fun| (fun.id(), *fun)).collect();
+
+        let wgpu_state = WgpuState::new(
+            &preimage,
+            &image,
+            batch_size,
+            permutations,
+            stack_size,
+            constant_pool_size,
+            shader,
+        )?;
 
         Ok(Self {
             functions,
             function_names,
-            shader_artifact: artifact,
+            wgpu_state,
             preimage,
-            image: image.into(),
+            image,
+            constant_pool_size,
         })
     }
 
@@ -157,42 +183,22 @@ impl StaticEvaluator {
     ) -> Result<
         (
             FastHashMap<crate::ops::gpu::Function, SmolStr>,
-            CompilationArtifact,
+            naga::Module,
+            [u32; 3],
         ),
         StaticEvaluatorError,
     > {
-        let compiler = Compiler::new().ok_or(StaticEvaluatorError::ShaderC(None))?;
-        let mut options =
-            CompileOptions::new().ok_or(StaticEvaluatorError::ShaderC(None))?;
-
-        options.set_target_env(TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_3 as u32);
-        options.set_generate_debug_info();
-        options.set_optimization_level(OptimizationLevel::Performance);
-        options.set_source_language(SourceLanguage::GLSL);
-        options.add_macro_definition(
-            macro_identifiers::opkind::VARIABLE,
-            Some(&rpn::OPKIND_VARIABLE.to_string()),
-        );
-        options.add_macro_definition(
-            macro_identifiers::opkind::CONSTANT,
-            Some(&rpn::OPKIND_CONSTANT.to_string()),
-        );
-        options.add_macro_definition(
-            macro_identifiers::opkind::FUNCTION,
-            Some(&rpn::OPKIND_FUNCTION.to_string()),
-        );
-        options.add_macro_definition(
-            macro_identifiers::BATCH_SIZE,
-            Some(&batch_size.to_string()),
-        );
-        options.add_macro_definition(
-            macro_identifiers::PERMUTATIONS,
-            Some(&permutations.to_string()),
-        );
-        options.add_macro_definition(
-            macro_identifiers::STACK_SIZE,
-            Some(&stack_size.to_string()),
-        );
+        let defines = [
+            (macro_identifiers::opkind::VARIABLE, rpn::OPKIND_VARIABLE),
+            (macro_identifiers::opkind::CONSTANT, rpn::OPKIND_CONSTANT),
+            (macro_identifiers::opkind::FUNCTION, batch_size),
+            (macro_identifiers::BATCH_SIZE, batch_size),
+            (macro_identifiers::PERMUTATIONS, permutations),
+            (macro_identifiers::STACK_SIZE, stack_size),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
 
         let sanitized = Self::sanitize_function_definitions(functions)?;
 
@@ -240,14 +246,16 @@ impl StaticEvaluator {
             evaluation_text
         );
 
-        let artifact = compiler.compile_into_spirv(
-            &shader_source,
-            ShaderKind::Compute,
-            "rssr::tree::eval::gpu::StaticEvaluator::SHADER_SOURCE",
-            "main",
-            Some(&options),
-        )?;
-        Ok((function_names, artifact))
+        let mut naga_front = naga::front::glsl::Frontend::default();
+        let options = naga::front::glsl::Options {
+            stage: naga::ShaderStage::Compute,
+            defines,
+        };
+
+        let module = naga_front.parse(&options, &shader_source)?;
+        let wg_size = naga_front.metadata().workgroup_size;
+
+        Ok((function_names, module, wg_size))
     }
 
     fn sanitize_function_definitions(
@@ -433,7 +441,7 @@ impl StaticEvaluator {
                 head: Box::new(ExprData::variable(id_param_ident).into_node()),
                 body: functions
                     .into_iter()
-                    .map(|function| {
+                    .flat_map(|function| {
                         let id = function.id;
                         let arity = function.arity as u32;
                         let ident =
@@ -491,8 +499,7 @@ impl StaticEvaluator {
                         .into_node();
                         [label, ret]
                     })
-                    .collect::<Vec<_>>()
-                    .concat::<Statement>(),
+                    .collect::<Vec<_>>(),
             }
             .into_node(),
         )
@@ -518,6 +525,65 @@ impl StaticEvaluator {
 
     fn generate_function_name(id: usize) -> SmolStr {
         format!("_function{id}").into()
+    }
+}
+
+impl WgpuState {
+    fn new(
+        preimage: &DMatrix<f32>,
+        image: &[f32],
+        batch_size: usize,
+        permutations: usize,
+        stack_size: usize,
+        constant_pool_size: usize,
+        shader: naga::Module,
+    ) -> Result<Self, StaticEvaluatorError> {
+        assert_eq!(preimage.nrows(), image.len());
+        let preimage_row_major = preimage
+            .row_iter()
+            .flat_map(|row| row.iter().copied().collect_vec())
+            .collect_vec();
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN
+                | wgpu::Backends::DX12
+                | wgpu::Backends::METAL,
+            ..Default::default()
+        });
+
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))
+            .ok_or(StaticEvaluatorError::Wgpu(
+                "no suitable adapter found".into(),
+            ))?;
+
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: None,
+                required_features: wgpu::Features::PUSH_CONSTANTS
+                    | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS,
+                required_limits: wgpu::Limits {
+                    max_push_constant_size: 64,
+                    ..Default::default()
+                },
+            },
+            None,
+        ))
+        .map_err(|err| {
+            StaticEvaluatorError::Wgpu(format!("device request failed: {err}").into())
+        })?;
+
+        let workgroup_size = [batch_size as u32, permutations as u32, 0];
+        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Naga(Cow::Owned(shader)),
+        });
+
+        todo!()
     }
 }
 
@@ -683,14 +749,16 @@ mod tests {
         let batch_size = 64;
         let permutations = 32;
         let stack_size = 96;
+        let constant_pool_size = 16;
 
         StaticEvaluator::new(
             defs,
             batch_size,
             permutations,
             stack_size,
+            constant_pool_size,
             preimage,
-            image.as_ref(),
+            image,
         )
         .map(|_| ())
     }

@@ -22,8 +22,10 @@ enum_dispatch = "0.3.12"
 glsl-lang = { version = "0.5.2", features = ["lexer-v2-full"] }
 glsl-lang-pp = "0.5.2"
 itertools = "0.13.0"
+naga = { version = "0.20.0", features = ["glsl-in"] }
 nalgebra = "0.32.5"
+pollster = "0.3.0"
 rayon = "1.10.0"
 shaderc = "0.8.3"
 thiserror = "1.0.61"
-wgpu = { version = "0.20.0", features = ["glsl"] }
+wgpu = { version = "0.20.0", features = ["naga-ir", "spirv"] }
