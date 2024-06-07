@@ -6,21 +6,12 @@
     PERMUTATIONS: number of permutations; the y dimension of the work group
     STACK_SIZE: size of private stack; should not be smaller than expression tree
 
-
     OPKINDs: uint literals
     - OPKIND_VARIABLE
     - OPKIND_CONSTANT
     - OPKIND_FUNCTION
 
-    FUNCTION_EVALUATION:
-        must define a function definition
-        of prototype `float _function(uint id, uint sp, float stack[STACK_SIZE])`
-        that translates the `functionID` into a function (
-        of prototype `float _functionXYZ(float p1, float p2, ..., float pn)`
-        ) call using the operands on the stack
-
-    FUNCTION_DEFINITIONS:
-        must contain definitions of the functions used in function-evaluation.
+    a definition of the `_eval` function is also required
 */
 
 layout (std430, set = 0, binding = 0) readonly buffer Preimage {
@@ -84,7 +75,7 @@ layout (local_size_x = BATCH_SIZE, local_size_y = PERMUTATIONS, local_size_z = 1
 uint _prefactor(uint permutationIdx, uint nodeIdx);
 float _sample(uint batchIdx, uint dimension);
 float _eval(uint batchIdx, uint permutationIdx, uint expressionSize);
-float _function(uint functionID, uint sp, uint stack[STACK_SIZE]);
+float _function(uint functionID, uint sp, float stack[STACK_SIZE]);
 
 
 void main() {
@@ -135,6 +126,3 @@ float _eval(uint batchIdx, uint permutationIdx, uint treeSize) {
     }
     return stack[sp];
 }
-
-FUNCTION_DEFINITIONS
-FUNCTION_EVALUATION

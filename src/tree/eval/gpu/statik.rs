@@ -1,6 +1,7 @@
 use std::fmt::Formatter;
 
 use glsl_lang::ast::{NodeContent, SmolStr};
+use itertools::Itertools;
 use shaderc::{
     CompilationArtifact, CompileOptions, Compiler, OptimizationLevel, ShaderKind,
     SourceLanguage, TargetEnv,
@@ -203,18 +204,15 @@ impl StaticEvaluator {
             text
         };
 
-        options.add_macro_definition(
-            macro_identifiers::FUNCTION_DEFINITIONS,
-            Some(&definitions_text),
-        );
-
-        options.add_macro_definition(
-            macro_identifiers::FUNCTION_EVALUATION,
-            Some(&evaluation_text),
+        let shader_source = format!(
+            "{}\n{}\n{}",
+            Self::SHADER_SOURCE,
+            definitions_text,
+            evaluation_text
         );
 
         let artifact = compiler.compile_into_spirv(
-            Self::SHADER_SOURCE,
+            &shader_source,
             ShaderKind::Compute,
             "rssr::tree::eval::gpu::StaticEvaluator::SHADER_SOURCE",
             "main",
@@ -482,16 +480,10 @@ impl StaticEvaluator {
                             .into_node(),
                         )
                         .into_node();
-
-                        StatementData::Compound(
-                            CompoundStatementData {
-                                statement_list: vec![label, ret],
-                            }
-                            .into_node(),
-                        )
-                        .into_node()
+                        [label, ret]
                     })
-                    .collect(),
+                    .collect::<Vec<_>>()
+                    .concat::<Statement>(),
             }
             .into_node(),
         )
