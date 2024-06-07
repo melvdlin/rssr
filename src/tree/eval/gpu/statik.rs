@@ -1,15 +1,42 @@
 use std::fmt::Formatter;
-use std::io::Read;
 
-use anyhow::Context;
 use glsl_lang::ast::{NodeContent, SmolStr};
 use shaderc::{
-    CompileOptions, Compiler, OptimizationLevel, ShaderKind, SourceLanguage, TargetEnv,
+    CompilationArtifact, CompileOptions, Compiler, OptimizationLevel, ShaderKind,
+    SourceLanguage, TargetEnv,
 };
 use wgpu::naga::FastHashMap;
 
 pub struct StaticEvaluator {
     functions: FastHashMap<usize, crate::ops::gpu::Function>,
+    function_names: FastHashMap<crate::ops::gpu::Function, SmolStr>,
+    shader_artifact: CompilationArtifact,
+    preimage: nalgebra::DMatrix<f32>,
+    image: Box<[f32]>,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum StaticEvaluatorError {
+    #[error(
+        r"preimage and image must have the same number of rows
+         (preimage has {preimage_rows}, image has {image_rows})"
+    )]
+    Dataset {
+        preimage_rows: usize,
+        image_rows: usize,
+    },
+    #[error(
+        r"batch size must not be larger than preimage
+         (batch size: {batch_size}, preimage: {preimage_rows} rows)"
+    )]
+    BatchSize {
+        batch_size: usize,
+        preimage_rows: usize,
+    },
+    #[error("shaderc error")]
+    ShaderC(#[from] Option<shaderc::Error>),
+    #[error("{0}")]
+    FunctionSanitize(#[from] FunctionSanitizeError),
 }
 
 #[derive(Clone, Debug)]
@@ -23,6 +50,51 @@ pub enum FunctionSanitizeError {
         position: usize,
         expected_type: glsl_lang::ast::TypeSpecifier,
     },
+}
+
+mod rpn {
+    use crevice::std140::AsStd140;
+
+    use crate::ops::gpu::Function;
+    use crate::tree::{NAryFunction, Node};
+
+    pub const OPKIND_VARIABLE: usize = 0;
+    pub const OPKIND_CONSTANT: usize = 1;
+    pub const OPKIND_FUNCTION: usize = 2;
+
+    #[derive(AsStd140)]
+    pub struct TreeNode {
+        opkind: u32,
+        immediate: u32,
+        function_id: u32,
+    }
+
+    impl TreeNode {
+        pub fn traverse(root: &Node<f32, Function>, stack: &mut Vec<Self>) {
+            match root {
+                | Node::Constant(constant) => stack.push(Self {
+                    opkind: OPKIND_CONSTANT as u32,
+                    immediate: constant.id as u32,
+                    function_id: 0,
+                }),
+                | Node::Variable(variable) => stack.push(Self {
+                    opkind: OPKIND_VARIABLE as u32,
+                    immediate: variable.id as u32,
+                    function_id: 0,
+                }),
+                | Node::Function(function) => {
+                    stack.push(Self {
+                        opkind: OPKIND_FUNCTION as u32,
+                        immediate: function.function.arity() as u32,
+                        function_id: function.function.id() as u32,
+                    });
+                    for operand in &*function.operands {
+                        Self::traverse(operand, stack);
+                    }
+                }
+            }
+        }
+    }
 }
 
 mod macro_identifiers {
@@ -47,13 +119,26 @@ impl StaticEvaluator {
         batch_size: usize,
         permutations: usize,
         stack_size: usize,
-        opkind_variable: usize,
-        opkind_constant: usize,
-        opkind_function: usize,
-    ) -> anyhow::Result<Self> {
-        let compiler = Compiler::new().context("Failed to initialise SPIRV compiler")?;
-        let mut options = CompileOptions::new()
-            .context("Failed to initialise SPIRV compile options")?;
+        preimage: nalgebra::DMatrix<f32>,
+        image: &[f32],
+    ) -> Result<Self, StaticEvaluatorError> {
+        if preimage.nrows() != image.len() {
+            return Err(StaticEvaluatorError::Dataset {
+                preimage_rows: preimage.nrows(),
+                image_rows: image.len(),
+            });
+        }
+
+        if batch_size > preimage.nrows() {
+            return Err(StaticEvaluatorError::BatchSize {
+                batch_size,
+                preimage_rows: preimage.nrows(),
+            });
+        }
+
+        let compiler = Compiler::new().ok_or(StaticEvaluatorError::ShaderC(None))?;
+        let mut options =
+            CompileOptions::new().ok_or(StaticEvaluatorError::ShaderC(None))?;
 
         options.set_target_env(TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_3 as u32);
         options.set_generate_debug_info();
@@ -61,15 +146,15 @@ impl StaticEvaluator {
         options.set_source_language(SourceLanguage::GLSL);
         options.add_macro_definition(
             macro_identifiers::opkind::VARIABLE,
-            Some(&opkind_variable.to_string()),
+            Some(&rpn::OPKIND_VARIABLE.to_string()),
         );
         options.add_macro_definition(
             macro_identifiers::opkind::CONSTANT,
-            Some(&opkind_constant.to_string()),
+            Some(&rpn::OPKIND_CONSTANT.to_string()),
         );
         options.add_macro_definition(
             macro_identifiers::opkind::FUNCTION,
-            Some(&opkind_function.to_string()),
+            Some(&rpn::OPKIND_FUNCTION.to_string()),
         );
         options.add_macro_definition(
             macro_identifiers::BATCH_SIZE,
@@ -84,10 +169,49 @@ impl StaticEvaluator {
             Some(&stack_size.to_string()),
         );
 
-        let sanitized = Self::sanitize_function_definitions(functions)
-            .context("Failed to sanitize functions")?;
+        let sanitized = Self::sanitize_function_definitions(functions)?;
 
-        let evaluation = todo!();
+        let evaluation = Self::generate_function_evaluation(
+            sanitized.iter().map(|(_def, fun, _name)| fun).cloned(),
+            stack_size,
+        );
+
+        let definitions_text = sanitized
+            .iter()
+            .map(|(def, _fun, _name)| def)
+            .map(|fun| {
+                let mut text = String::new();
+                glsl_lang::transpiler::glsl::show_function_definition(
+                    &mut text,
+                    fun,
+                    &mut Default::default(),
+                )?;
+                Ok::<_, std::fmt::Error>(text)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Failed to render functions")
+            .join("\n\n");
+
+        let evaluation_text = {
+            let mut text = String::new();
+            glsl_lang::transpiler::glsl::show_function_definition(
+                &mut text,
+                &evaluation,
+                &mut Default::default(),
+            )
+            .expect("Failed to render function evaluation");
+            text
+        };
+
+        options.add_macro_definition(
+            macro_identifiers::FUNCTION_DEFINITIONS,
+            Some(&definitions_text),
+        );
+
+        options.add_macro_definition(
+            macro_identifiers::FUNCTION_EVALUATION,
+            Some(&evaluation_text),
+        );
 
         let artifact = compiler.compile_into_spirv(
             Self::SHADER_SOURCE,
@@ -97,7 +221,22 @@ impl StaticEvaluator {
             Some(&options),
         )?;
 
-        todo!()
+        let functions = sanitized
+            .iter()
+            .map(|(_def, fun, _name)| (fun.id(), *fun))
+            .collect();
+        let function_names = sanitized
+            .iter()
+            .map(|(_def, fun, name)| (*fun, name.clone()))
+            .collect();
+
+        Ok(Self {
+            functions,
+            function_names,
+            shader_artifact: artifact,
+            preimage,
+            image: image.into(),
+        })
     }
 
     fn sanitize_function_definitions(
@@ -282,7 +421,7 @@ impl StaticEvaluator {
             parameters: vec![id_param, sp_param, stack_param],
         };
 
-        let switch: Statement = StatementData::Switch(
+        let switch = StatementData::Switch(
             SwitchStatementData {
                 head: Box::new(ExprData::variable(id_param_ident).into_node()),
                 body: functions
@@ -352,29 +491,16 @@ impl StaticEvaluator {
                         )
                         .into_node()
                     })
-                    .chain(std::iter::once({
-                        let label =
-                            StatementData::CaseLabel(CaseLabelData::Def.into_node())
-                                .into_node();
-
-                        let ret = StatementData::Jump(
-                            JumpStatementData::Return(Some(Box::new(
-                                ExprData::FloatConst(0.0).into_node(),
-                            )))
-                            .into_node(),
-                        )
-                        .into_node();
-
-                        StatementData::Compound(
-                            CompoundStatementData {
-                                statement_list: vec![label, ret],
-                            }
-                            .into_node(),
-                        )
-                        .into_node()
-                    }))
                     .collect(),
             }
+            .into_node(),
+        )
+        .into_node();
+
+        let ret = StatementData::Jump(
+            JumpStatementData::Return(Some(Box::new(
+                ExprData::FloatConst(0.0).into_node(),
+            )))
             .into_node(),
         )
         .into_node();
@@ -382,7 +508,7 @@ impl StaticEvaluator {
         FunctionDefinitionData {
             prototype: prototype.into_node(),
             statement: CompoundStatementData {
-                statement_list: vec![switch],
+                statement_list: vec![switch, ret],
             }
             .into_node(),
         }
@@ -469,5 +595,96 @@ impl std::fmt::Display for FunctionSanitizeError {
                 )
             }
         }
+    }
+}
+
+impl std::error::Error for FunctionSanitizeError {}
+
+#[cfg(test)]
+mod tests {
+    use crate::tree::eval::gpu::statik::{StaticEvaluator, StaticEvaluatorError};
+    use glsl_lang::ast::FunctionDefinition;
+    use glsl_lang::parse::Parsable;
+    use nalgebra::DMatrix;
+
+    fn function_defs() -> Result<Vec<FunctionDefinition>, Box<dyn std::error::Error>> {
+        const FUNCTION_DEFS_TEXT: &[&str] = &[
+            r"
+            float add(float lhs, float rhs) {
+                return lhs + rhs;
+            }
+            ",
+            r"
+            float sub(float lhs, float rhs) {
+                return lhs - rhs;
+            }
+            ",
+            r"
+            float mul(float lhs, float rhs) {
+                return lhs * rhs;
+            }
+            ",
+            r"
+            float div(float lhs, float rhs) {
+                return lhs / rhs;
+            }
+            ",
+            r"
+            float neg(float rhs) {
+                return rhs * -1;
+            }
+            ",
+            r"
+            float sin(float x) {
+                return sin(x);
+            }
+            ",
+            r"
+            float clamp(float x, float lo, float hi) {
+                if (x < lo) {
+                    return lo;
+                }
+                if (x > hi) {
+                    return hi;
+                }
+                return x;
+            }
+            ",
+        ];
+
+        Ok(FUNCTION_DEFS_TEXT
+            .iter()
+            .cloned()
+            .map(glsl_lang::ast::FunctionDefinition::parse)
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    #[test]
+    fn parse_function_defs() {
+        function_defs().expect("Failed to parse function definitions");
+    }
+
+    #[test]
+    fn test_shader_gen() -> Result<(), StaticEvaluatorError> {
+        let defs = function_defs().expect("Failed to parse function definitions");
+        let dimensions = 4;
+        let rows = 1024;
+        let preimage =
+            DMatrix::from_iterator(rows, dimensions, (0..).take(dimensions * rows))
+                .cast::<f32>();
+        let image = (0..).take(rows).map(|n| n as f32).collect::<Box<[f32]>>();
+        let batch_size = 64;
+        let permutations = 32;
+        let stack_size = 96;
+
+        StaticEvaluator::new(
+            defs,
+            batch_size,
+            permutations,
+            stack_size,
+            preimage,
+            image.as_ref(),
+        )
+        .map(|_| ())
     }
 }
