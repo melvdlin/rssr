@@ -1,7 +1,6 @@
 use std::fmt::Formatter;
 
-use glsl_lang::ast::{NodeContent, SmolStr};
-use itertools::Itertools;
+use glsl_lang::ast::{FunctionDefinition, SmolStr};
 use shaderc::{
     CompilationArtifact, CompileOptions, Compiler, OptimizationLevel, ShaderKind,
     SourceLanguage, TargetEnv,
@@ -137,6 +136,31 @@ impl StaticEvaluator {
             });
         }
 
+        let (function_names, artifact) =
+            Self::generate_shader(functions, batch_size, permutations, stack_size)?;
+        let functions = function_names.keys().map(|fun| (fun.id(), *fun)).collect();
+
+        Ok(Self {
+            functions,
+            function_names,
+            shader_artifact: artifact,
+            preimage,
+            image: image.into(),
+        })
+    }
+
+    fn generate_shader(
+        functions: impl IntoIterator<Item = FunctionDefinition>,
+        batch_size: usize,
+        permutations: usize,
+        stack_size: usize,
+    ) -> Result<
+        (
+            FastHashMap<crate::ops::gpu::Function, SmolStr>,
+            CompilationArtifact,
+        ),
+        StaticEvaluatorError,
+    > {
         let compiler = Compiler::new().ok_or(StaticEvaluatorError::ShaderC(None))?;
         let mut options =
             CompileOptions::new().ok_or(StaticEvaluatorError::ShaderC(None))?;
@@ -176,6 +200,11 @@ impl StaticEvaluator {
             sanitized.iter().map(|(_def, fun, _name)| fun).cloned(),
             stack_size,
         );
+
+        let function_names = sanitized
+            .iter()
+            .map(|(_def, fun, name)| (*fun, name.clone()))
+            .collect();
 
         let definitions_text = sanitized
             .iter()
@@ -218,33 +247,13 @@ impl StaticEvaluator {
             "main",
             Some(&options),
         )?;
-
-        let functions = sanitized
-            .iter()
-            .map(|(_def, fun, _name)| (fun.id(), *fun))
-            .collect();
-        let function_names = sanitized
-            .iter()
-            .map(|(_def, fun, name)| (*fun, name.clone()))
-            .collect();
-
-        Ok(Self {
-            functions,
-            function_names,
-            shader_artifact: artifact,
-            preimage,
-            image: image.into(),
-        })
+        Ok((function_names, artifact))
     }
 
     fn sanitize_function_definitions(
-        functions: impl IntoIterator<Item = glsl_lang::ast::FunctionDefinition>,
+        functions: impl IntoIterator<Item = FunctionDefinition>,
     ) -> Result<
-        Vec<(
-            glsl_lang::ast::FunctionDefinition,
-            crate::ops::gpu::Function,
-            SmolStr,
-        )>,
+        Vec<(FunctionDefinition, crate::ops::gpu::Function, SmolStr)>,
         FunctionSanitizeError,
     > {
         use glsl_lang::ast::*;
@@ -347,7 +356,7 @@ impl StaticEvaluator {
     fn generate_function_evaluation(
         functions: impl IntoIterator<Item = crate::ops::gpu::Function>,
         stack_size: usize,
-    ) -> glsl_lang::ast::FunctionDefinition {
+    ) -> FunctionDefinition {
         use glsl_lang::ast::*;
 
         fn parameter_declaration(
@@ -651,6 +660,16 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    fn test_data() -> (DMatrix<f32>, Box<[f32]>) {
+        let dimensions = 4;
+        let rows = 1024;
+        let preimage =
+            DMatrix::from_iterator(rows, dimensions, (0..).take(dimensions * rows))
+                .cast::<f32>();
+        let image = (0..).take(rows).map(|n| n as f32).collect::<Box<[f32]>>();
+        (preimage, image)
+    }
+
     #[test]
     fn parse_function_defs() {
         function_defs().expect("Failed to parse function definitions");
@@ -659,12 +678,8 @@ mod tests {
     #[test]
     fn test_shader_gen() -> Result<(), StaticEvaluatorError> {
         let defs = function_defs().expect("Failed to parse function definitions");
-        let dimensions = 4;
-        let rows = 1024;
-        let preimage =
-            DMatrix::from_iterator(rows, dimensions, (0..).take(dimensions * rows))
-                .cast::<f32>();
-        let image = (0..).take(rows).map(|n| n as f32).collect::<Box<[f32]>>();
+
+        let (preimage, image) = test_data();
         let batch_size = 64;
         let permutations = 32;
         let stack_size = 96;
