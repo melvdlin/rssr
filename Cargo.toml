@@ -15,6 +15,7 @@ opt-level = 0
 [dependencies]
 anyhow = "1.0.86"
 approx = "0.5.1"
+bytemuck = "1.16.0"
 clap = "4.5.4"
 crevice = "0.16.0"
 enum_delegate = "0.2.0"

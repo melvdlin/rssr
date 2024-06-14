@@ -1,5 +1,12 @@
 #version 460
 
+#define BATCH_SIZE 64
+#define PERMUTATIONS 32
+#define STACK_SIZE 96
+#define OPKIND_VARIABLE 0
+#define OPKIND_CONSTANT 1
+#define OPKIND_FUNCTION 2
+
 /*  required #defines:
 
     BATCH_SIZE: batch size; the x dimension of the work group
@@ -125,4 +132,63 @@ float _eval(uint batchIdx, uint permutationIdx, uint treeSize) {
         sp += 1;
     }
     return stack[sp];
+}
+float _function0(float lhs, float rhs) {
+    return lhs + rhs;
+}
+
+
+float _function1(float lhs, float rhs) {
+    return lhs - rhs;
+}
+
+
+float _function2(float lhs, float rhs) {
+    return lhs * rhs;
+}
+
+
+float _function3(float lhs, float rhs) {
+    return lhs / rhs;
+}
+
+
+float _function4(float rhs) {
+    return rhs * -1;
+}
+
+
+float _function5(float x) {
+    return sin(x);
+}
+
+
+float _function6(float x, float lo, float hi) {
+    if (x < lo) {
+        return lo;
+    }
+    if (x > hi) {
+        return hi;
+    }
+    return x;
+}
+
+float _function(uint id, uint sp, float stack[96u]) {
+    switch (id) {
+        case 0u:
+        return _function0(stack[sp - 1u], stack[sp - 2u]);
+        case 1u:
+        return _function1(stack[sp - 1u], stack[sp - 2u]);
+        case 2u:
+        return _function2(stack[sp - 1u], stack[sp - 2u]);
+        case 3u:
+        return _function3(stack[sp - 1u], stack[sp - 2u]);
+        case 4u:
+        return _function4(stack[sp - 1u]);
+        case 5u:
+        return _function5(stack[sp - 1u]);
+        case 6u:
+        return _function6(stack[sp - 1u], stack[sp - 2u], stack[sp - 3u]);
+    }
+    return 0.;
 }
