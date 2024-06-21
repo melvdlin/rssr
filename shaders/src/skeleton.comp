@@ -74,8 +74,8 @@ layout (local_size_x = BATCH_SIZE, local_size_y = PERMUTATIONS, local_size_z = 1
 
 float _prefactor(uint permutationIdx, uint nodeIdx);
 float _sample(uint batchIdx, uint dimension);
-float _eval(uint batchIdx, uint permutationIdx, uint expressionSize);
 float _function(uint functionID, uint sp, float stack[STACK_SIZE]);
+float _eval(uint batchIdx, uint permutationIdx, uint expressionSize);
 
 
 void main() {

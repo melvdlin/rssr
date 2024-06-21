@@ -1,15 +1,15 @@
-use crevice::std430::AsStd430;
 use std::borrow::Cow;
 use std::fmt::Formatter;
-use std::mem;
 use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::mpsc;
 
+use crevice::std430::AsStd430;
 use glsl_lang::ast::{FunctionDefinition, SmolStr};
 use itertools::Itertools;
 use nalgebra::DMatrix;
+use shaderc::CompilationArtifact;
 use wgpu::naga::FastHashMap;
 
 pub struct StaticEvaluator {
@@ -88,7 +88,6 @@ pub enum FunctionSanitizeError {
 }
 
 mod rpn {
-
     use crate::ops::gpu::Function;
     use crate::tree::{NAryFunction, Node};
 
@@ -171,16 +170,13 @@ impl StaticEvaluator {
             });
         }
 
-        let (function_names, shader, wg_size) = Self::generate_shader(
+        let (function_names, artifact) = Self::generate_shader(
             functions,
             batch_size.get(),
             permutations.get(),
             max_tree_size.get(),
         )?;
-        assert_eq!(
-            wg_size,
-            [batch_size.get() as u32, permutations.get() as u32, 1]
-        );
+
         let functions = function_names.keys().map(|fun| (fun.id(), *fun)).collect();
 
         let wgpu_state = WgpuState::new(
@@ -190,7 +186,7 @@ impl StaticEvaluator {
             permutations,
             max_tree_size,
             constant_pool_size,
-            shader,
+            artifact.as_binary(),
         )?;
 
         Ok(Self {
@@ -212,8 +208,7 @@ impl StaticEvaluator {
     ) -> Result<
         (
             FastHashMap<crate::ops::gpu::Function, SmolStr>,
-            naga::Module,
-            [u32; 3],
+            CompilationArtifact,
         ),
         StaticEvaluatorError,
     > {
@@ -227,7 +222,7 @@ impl StaticEvaluator {
         ]
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect();
+        .collect_vec();
 
         let sanitized = Self::sanitize_function_definitions(functions)?;
 
@@ -275,18 +270,74 @@ impl StaticEvaluator {
             evaluation_text
         );
 
-        let mut naga_front = naga::front::glsl::Frontend::default();
-        let options = naga::front::glsl::Options {
-            stage: naga::ShaderStage::Compute,
-            defines,
-        };
+        let compiler =
+            shaderc::Compiler::new().ok_or(StaticEvaluatorError::ShaderC(None))?;
+        let mut options =
+            shaderc::CompileOptions::new().ok_or(StaticEvaluatorError::ShaderC(None))?;
+        options.set_optimization_level(shaderc::OptimizationLevel::Performance);
+        options.set_source_language(shaderc::SourceLanguage::GLSL);
+        // options.set_generate_debug_info();
+        options.set_target_spirv(shaderc::SpirvVersion::V1_6);
+        options.set_target_env(
+            shaderc::TargetEnv::Vulkan,
+            shaderc::EnvVersion::Vulkan1_3 as u32,
+        );
 
-        println!("{shader_source}");
+        for (symbol, definition) in defines {
+            options.add_macro_definition(&symbol, Some(&definition))
+        }
 
-        let module = naga_front.parse(&options, &shader_source)?;
-        let wg_size = naga_front.metadata().workgroup_size;
+        let artifact = compiler.compile_into_spirv(
+            &shader_source,
+            shaderc::ShaderKind::Compute,
+            "processed_skeleton.comp",
+            "main",
+            Some(&options),
+        )?;
 
-        Ok((function_names, module, wg_size))
+        let text = compiler.compile_into_spirv_assembly(
+            &shader_source,
+            shaderc::ShaderKind::Compute,
+            "processed_skeleton.comp",
+            "main",
+            Some(&options),
+        )?;
+
+        // println!("{shader_source}");
+        println!("{}", text.as_text());
+
+        let mut binary = artifact.as_binary().iter().copied();
+        let magic_number = binary.next().unwrap();
+        let version = binary.next().unwrap();
+        let generator_magic_number = binary.next().unwrap();
+        let bound = binary.next().unwrap();
+        binary.next();
+        let mut instructions = Vec::new();
+        while let Some(inst) = binary.next() {
+            let op = inst as u16;
+            let wc = (inst >> 16) as u16;
+            let operands = binary.by_ref().take(wc as usize - 1).collect_vec();
+            instructions.push((op, wc, operands));
+        }
+        println!("---------------------");
+        println!("magic number:           {magic_number}");
+        println!("version:                {version}");
+        println!("generator magic number: {generator_magic_number}");
+        println!("bound:                  {bound}");
+        println!(
+            "{}",
+            instructions
+                .into_iter()
+                .map(|(op, wc, operands)| format!(
+                    "OP: {:04x}, WC: {:04x}; Operands: {}",
+                    op,
+                    wc,
+                    operands.iter().map(|op| format!("{:08x}", op)).join(", ")
+                ))
+                .join("\n")
+        );
+
+        Ok((function_names, artifact))
     }
 
     fn sanitize_function_definitions(
@@ -567,7 +618,7 @@ impl WgpuState {
         permutations: NonZeroUsize,
         max_tree_size: NonZeroUsize,
         constant_pool_size: NonZeroUsize,
-        shader: naga::Module,
+        spirv: &[u32],
     ) -> Result<Self, StaticEvaluatorError> {
         assert!(!preimage.is_empty());
         assert!(!image.is_empty());
@@ -606,10 +657,10 @@ impl WgpuState {
             StaticEvaluatorError::Wgpu(format!("device request failed: {err}").into())
         })?;
 
-        let workgroup_size = [batch_size.get() as u32, permutations.get() as u32, 0];
+        let workgroup_size = [batch_size.get() as u32, permutations.get() as u32, 1];
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Naga(Cow::Owned(shader)),
+            source: wgpu::ShaderSource::SpirV(Cow::Borrowed(spirv)),
         });
 
         let preimage_buffer_size =
@@ -849,7 +900,7 @@ impl WgpuState {
     fn upload_dataset(&self, preimage: &DMatrix<f32>, image: &[f32]) {
         let row_major_preimage = preimage.transpose().iter().copied().collect_vec();
 
-        let preimage_size = mem::size_of_val(preimage) as wgpu::BufferAddress;
+        let preimage_size = std::mem::size_of_val(preimage) as wgpu::BufferAddress;
 
         self.write_buffer(&self.dataset_stage, 0, &row_major_preimage);
         self.write_buffer(&self.dataset_stage, preimage_size, &image);
@@ -868,7 +919,7 @@ impl WgpuState {
         offset: wgpu::BufferAddress,
         data: &[T],
     ) {
-        let data_size = mem::size_of_val(data) as wgpu::BufferAddress;
+        let data_size = std::mem::size_of_val(data) as wgpu::BufferAddress;
         assert!(stage.size() >= data_size + offset);
 
         let data_bytes = data.iter().flat_map(bytemuck::bytes_of).copied();
@@ -1021,10 +1072,11 @@ impl std::error::Error for FunctionSanitizeError {}
 
 #[cfg(test)]
 mod tests {
-    use crate::tree::eval::gpu::statik::{StaticEvaluator, StaticEvaluatorError};
     use glsl_lang::ast::FunctionDefinition;
     use glsl_lang::parse::Parsable;
     use nalgebra::DMatrix;
+
+    use crate::tree::eval::gpu::statik::{StaticEvaluator, StaticEvaluatorError};
 
     fn function_defs() -> Result<Vec<FunctionDefinition>, Box<dyn std::error::Error>> {
         const FUNCTION_DEFS_TEXT: &[&str] = &[
