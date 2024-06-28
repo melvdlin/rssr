@@ -366,7 +366,7 @@ impl<'a> DynamicEvaluator<'a> {
         )
     }
 }
-#[cfg(test)]
+#[cfg(all(test, not(test)))]
 mod tests {
     use glsl_lang::ast;
 

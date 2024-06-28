@@ -1,16 +1,19 @@
 use std::borrow::Cow;
-use std::fmt::Formatter;
 use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::mpsc;
 
+use crate::tree::eval::gpu::statik::shader::generate_shader;
 use crevice::std430::AsStd430;
-use glsl_lang::ast::{FunctionDefinition, SmolStr};
+use glsl_lang::ast::{NodeContent, SmolStr};
+use glsl_lang::parse::Parsable;
 use itertools::Itertools;
 use nalgebra::DMatrix;
-use shaderc::CompilationArtifact;
+use shader::FunctionSanitizeError;
 use wgpu::naga::FastHashMap;
+
+mod shader;
 
 pub struct StaticEvaluator {
     functions: FastHashMap<usize, crate::ops::gpu::Function>,
@@ -64,6 +67,8 @@ pub enum StaticEvaluatorError {
         batch_size: NonZeroUsize,
         preimage_rows: usize,
     },
+    #[error("shader contains cycle")]
+    Cycle(SmolStr),
     #[error("shaderc error")]
     ShaderC(#[from] Option<shaderc::Error>),
     #[error("naga error: {0}")]
@@ -72,19 +77,6 @@ pub enum StaticEvaluatorError {
     FunctionSanitize(#[from] FunctionSanitizeError),
     #[error("WGPU error: {0}")]
     Wgpu(SmolStr),
-}
-
-#[derive(Clone, Debug)]
-pub enum FunctionSanitizeError {
-    InvalidReturnType {
-        expected: glsl_lang::ast::FullySpecifiedType,
-        found: glsl_lang::ast::FullySpecifiedType,
-    },
-    InvalidParameter {
-        parameter: glsl_lang::ast::FunctionParameterDeclaration,
-        position: usize,
-        expected_type: glsl_lang::ast::TypeSpecifier,
-    },
 }
 
 mod rpn {
@@ -130,25 +122,10 @@ mod rpn {
     }
 }
 
-mod macro_identifiers {
-    pub mod opkind {
-        pub const VARIABLE: &str = "OPKIND_VARIABLE";
-        pub const CONSTANT: &str = "OPKIND_CONSTANT";
-        pub const FUNCTION: &str = "OPKIND_FUNCTION";
-    }
-    pub const BATCH_SIZE: &str = "BATCH_SIZE";
-    pub const PERMUTATIONS: &str = "PERMUTATIONS";
-    pub const STACK_SIZE: &str = "STACK_SIZE";
-    pub const FUNCTION_EVALUATION: &str = "FUNCTION_EVALUATION";
-    pub const FUNCTION_DEFINITIONS: &str = "FUNCTION_DEFINITIONS";
-}
-
+#[allow(unused)]
 impl StaticEvaluator {
-    const SHADER_SOURCE: &'static str =
-        include_str!(crate::proot!("shaders/src/skeleton.comp"));
-
     pub fn new(
-        functions: impl IntoIterator<Item = FunctionDefinition>,
+        functions: impl IntoIterator<Item = glsl_lang::ast::FunctionDefinition>,
         batch_size: NonZeroUsize,
         permutations: NonZeroUsize,
         max_tree_size: NonZeroUsize,
@@ -170,7 +147,7 @@ impl StaticEvaluator {
             });
         }
 
-        let (function_names, artifact) = Self::generate_shader(
+        let (function_names, artifact) = generate_shader(
             functions,
             batch_size.get(),
             permutations.get(),
@@ -197,416 +174,6 @@ impl StaticEvaluator {
             image,
             constant_pool_size,
         })
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn generate_shader(
-        functions: impl IntoIterator<Item = FunctionDefinition>,
-        batch_size: usize,
-        permutations: usize,
-        stack_size: usize,
-    ) -> Result<
-        (
-            FastHashMap<crate::ops::gpu::Function, SmolStr>,
-            CompilationArtifact,
-        ),
-        StaticEvaluatorError,
-    > {
-        let defines = [
-            (macro_identifiers::opkind::VARIABLE, rpn::OPKIND_VARIABLE),
-            (macro_identifiers::opkind::CONSTANT, rpn::OPKIND_CONSTANT),
-            (macro_identifiers::opkind::FUNCTION, batch_size),
-            (macro_identifiers::BATCH_SIZE, batch_size),
-            (macro_identifiers::PERMUTATIONS, permutations),
-            (macro_identifiers::STACK_SIZE, stack_size),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect_vec();
-
-        let sanitized = Self::sanitize_function_definitions(functions)?;
-
-        let evaluation = Self::generate_function_evaluation(
-            sanitized.iter().map(|(_def, fun, _name)| fun).cloned(),
-            stack_size,
-        );
-
-        let function_names = sanitized
-            .iter()
-            .map(|(_def, fun, name)| (*fun, name.clone()))
-            .collect();
-
-        let definitions_text = sanitized
-            .iter()
-            .map(|(def, _fun, _name)| def)
-            .map(|fun| {
-                let mut text = String::new();
-                glsl_lang::transpiler::glsl::show_function_definition(
-                    &mut text,
-                    fun,
-                    &mut Default::default(),
-                )?;
-                Ok::<_, std::fmt::Error>(text)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .expect("Failed to render functions")
-            .join("\n\n");
-
-        let evaluation_text = {
-            let mut text = String::new();
-            glsl_lang::transpiler::glsl::show_function_definition(
-                &mut text,
-                &evaluation,
-                &mut Default::default(),
-            )
-            .expect("Failed to render function evaluation");
-            text
-        };
-
-        let shader_source = format!(
-            "{}\n{}\n{}",
-            Self::SHADER_SOURCE,
-            definitions_text,
-            evaluation_text
-        );
-
-        let compiler =
-            shaderc::Compiler::new().ok_or(StaticEvaluatorError::ShaderC(None))?;
-        let mut options =
-            shaderc::CompileOptions::new().ok_or(StaticEvaluatorError::ShaderC(None))?;
-        options.set_optimization_level(shaderc::OptimizationLevel::Performance);
-        options.set_source_language(shaderc::SourceLanguage::GLSL);
-        // options.set_generate_debug_info();
-        options.set_target_spirv(shaderc::SpirvVersion::V1_6);
-        options.set_target_env(
-            shaderc::TargetEnv::Vulkan,
-            shaderc::EnvVersion::Vulkan1_3 as u32,
-        );
-
-        for (symbol, definition) in defines {
-            options.add_macro_definition(&symbol, Some(&definition))
-        }
-
-        let artifact = compiler.compile_into_spirv(
-            &shader_source,
-            shaderc::ShaderKind::Compute,
-            "processed_skeleton.comp",
-            "main",
-            Some(&options),
-        )?;
-
-        let text = compiler.compile_into_spirv_assembly(
-            &shader_source,
-            shaderc::ShaderKind::Compute,
-            "processed_skeleton.comp",
-            "main",
-            Some(&options),
-        )?;
-
-        // println!("{shader_source}");
-        println!("{}", text.as_text());
-
-        let mut binary = artifact.as_binary().iter().copied();
-        let magic_number = binary.next().unwrap();
-        let version = binary.next().unwrap();
-        let generator_magic_number = binary.next().unwrap();
-        let bound = binary.next().unwrap();
-        binary.next();
-        let mut instructions = Vec::new();
-        while let Some(inst) = binary.next() {
-            let op = inst as u16;
-            let wc = (inst >> 16) as u16;
-            let operands = binary.by_ref().take(wc as usize - 1).collect_vec();
-            instructions.push((op, wc, operands));
-        }
-        println!("---------------------");
-        println!("magic number:           {magic_number}");
-        println!("version:                {version}");
-        println!("generator magic number: {generator_magic_number}");
-        println!("bound:                  {bound}");
-        println!(
-            "{}",
-            instructions
-                .into_iter()
-                .map(|(op, wc, operands)| format!(
-                    "OP: {:04x}, WC: {:04x}; Operands: {}",
-                    op,
-                    wc,
-                    operands.iter().map(|op| format!("{:08x}", op)).join(", ")
-                ))
-                .join("\n")
-        );
-
-        Ok((function_names, artifact))
-    }
-
-    fn sanitize_function_definitions(
-        functions: impl IntoIterator<Item = FunctionDefinition>,
-    ) -> Result<
-        Vec<(FunctionDefinition, crate::ops::gpu::Function, SmolStr)>,
-        FunctionSanitizeError,
-    > {
-        use glsl_lang::ast::*;
-
-        fn validate_return_type(
-            function: &FunctionDefinition,
-        ) -> Result<(), FunctionSanitizeError> {
-            if function.prototype.ty.qualifier.is_some()
-                || function.prototype.ty.ty.array_specifier.is_some()
-                || !matches!(
-                    *function.prototype.ty.ty.ty,
-                    TypeSpecifierNonArrayData::Float
-                )
-            {
-                return Err(FunctionSanitizeError::InvalidReturnType {
-                    expected: FullySpecifiedTypeData {
-                        qualifier: None,
-                        ty: TypeSpecifierData {
-                            ty: TypeSpecifierNonArray::new(
-                                TypeSpecifierNonArrayData::Float,
-                                None,
-                            ),
-                            array_specifier: None,
-                        }
-                        .into(),
-                    }
-                    .into(),
-                    found: function.prototype.ty.clone(),
-                });
-            }
-            Ok(())
-        }
-
-        fn validate_parameter_type(
-            position: usize,
-            parameter: &FunctionParameterDeclaration,
-        ) -> Result<(), FunctionSanitizeError> {
-            let (qualifier, ty) = match &**parameter {
-                | FunctionParameterDeclarationData::Named(qualifier, declarator) => {
-                    (qualifier, &declarator.ty)
-                }
-                | FunctionParameterDeclarationData::Unnamed(qualifier, ty) => {
-                    (qualifier, ty)
-                }
-            };
-            if qualifier.is_some()
-                || !matches!(
-                    ty,
-                    TypeSpecifier {
-                        content: TypeSpecifierData {
-                            ty: TypeSpecifierNonArray {
-                                content: TypeSpecifierNonArrayData::Float,
-                                ..
-                            },
-                            array_specifier: None
-                        },
-                        ..
-                    }
-                )
-            {
-                return Err(FunctionSanitizeError::InvalidParameter {
-                    parameter: parameter.clone(),
-                    position,
-                    expected_type: TypeSpecifier {
-                        content: TypeSpecifierData {
-                            ty: TypeSpecifierNonArray {
-                                content: TypeSpecifierNonArrayData::Float,
-                                span: None,
-                            },
-                            array_specifier: None,
-                        },
-                        span: None,
-                    },
-                });
-            }
-            Ok(())
-        }
-
-        functions
-            .into_iter()
-            .enumerate()
-            .map(|(id, mut function)| {
-                validate_return_type(&function)?;
-
-                for (position, parameter) in
-                    function.prototype.parameters.iter().enumerate()
-                {
-                    validate_parameter_type(position, parameter)?;
-                }
-                let arity = function.prototype.parameters.len();
-                let op = crate::ops::gpu::Function::new(id, arity);
-                let mut ident = Self::generate_function_name(id);
-                std::mem::swap(&mut function.prototype.name.0, &mut ident);
-
-                Ok((function, op, ident))
-            })
-            .collect::<Result<Vec<_>, _>>()
-    }
-
-    fn generate_function_evaluation(
-        functions: impl IntoIterator<Item = crate::ops::gpu::Function>,
-        stack_size: usize,
-    ) -> FunctionDefinition {
-        use glsl_lang::ast::*;
-
-        fn parameter_declaration(
-            ident: Identifier,
-            ty: TypeSpecifierNonArrayData,
-            array: Option<ArraySpecifierData>,
-        ) -> FunctionParameterDeclaration {
-            FunctionParameterDeclarationData::Named(
-                None,
-                FunctionParameterDeclaratorData {
-                    ty: TypeSpecifierData {
-                        ty: ty.into_node(),
-                        array_specifier: None,
-                    }
-                    .into_node(),
-                    ident: ArrayedIdentifierData {
-                        ident,
-                        array_spec: array.map(Node::from),
-                    }
-                    .into_node(),
-                }
-                .into_node(),
-            )
-            .into_node()
-        }
-
-        // prototype:
-        // `float _function(uint id, uint sp, float stack[STACK_SIZE])`
-        // functions to call:
-        // `float _functionXYZ(float p1, float p2, ..., float pn)`
-
-        let function_ident = IdentifierData::from("_function").into_node();
-        let id_param_ident: Identifier = IdentifierData::from("id").into_node();
-        let sp_param_ident: Identifier = IdentifierData::from("sp").into_node();
-        let stack_param_ident: Identifier = IdentifierData::from("stack").into_node();
-        let id_param = parameter_declaration(
-            id_param_ident.clone(),
-            TypeSpecifierNonArrayData::UInt,
-            None,
-        );
-        let sp_param = parameter_declaration(
-            sp_param_ident.clone(),
-            TypeSpecifierNonArrayData::UInt,
-            None,
-        );
-
-        let stack_param = parameter_declaration(
-            stack_param_ident.clone(),
-            TypeSpecifierNonArrayData::Float,
-            Some(ArraySpecifierData {
-                dimensions: vec![ArraySpecifierDimensionData::ExplicitlySized(Box::new(
-                    ExprData::UIntConst(stack_size as u32).into_node(),
-                ))
-                .into_node()],
-            }),
-        );
-
-        let prototype = FunctionPrototypeData {
-            ty: FullySpecifiedTypeData {
-                qualifier: None,
-                ty: TypeSpecifierData {
-                    ty: TypeSpecifierNonArrayData::Float.into_node(),
-                    array_specifier: None,
-                }
-                .into(),
-            }
-            .into(),
-            name: function_ident,
-            parameters: vec![id_param, sp_param, stack_param],
-        };
-
-        let switch = StatementData::Switch(
-            SwitchStatementData {
-                head: Box::new(ExprData::variable(id_param_ident).into_node()),
-                body: functions
-                    .into_iter()
-                    .flat_map(|function| {
-                        let id = function.id;
-                        let arity = function.arity as u32;
-                        let ident =
-                            IdentifierData(Self::generate_function_name(id)).into_node();
-
-                        let label = StatementData::CaseLabel(
-                            CaseLabelData::Case(Box::new(
-                                ExprData::UIntConst(id as u32).into_node(),
-                            ))
-                            .into_node(),
-                        )
-                        .into_node();
-
-                        let ret = StatementData::Jump(
-                            JumpStatementData::Return(Some(Box::new(
-                                ExprData::FunCall(
-                                    FunIdentifierData::Expr(Box::new(
-                                        ExprData::variable(ident).into_node(),
-                                    ))
-                                    .into_node(),
-                                    (1..=arity)
-                                        .map(|offset| {
-                                            ExprData::Bracket(
-                                                Box::new(
-                                                    ExprData::variable(
-                                                        stack_param_ident.clone(),
-                                                    )
-                                                    .into_node(),
-                                                ),
-                                                Box::new(
-                                                    ExprData::Binary(
-                                                        BinaryOpData::Sub.into_node(),
-                                                        Box::new(
-                                                            ExprData::variable(
-                                                                sp_param_ident.clone(),
-                                                            )
-                                                            .into_node(),
-                                                        ),
-                                                        Box::new(
-                                                            ExprData::UIntConst(offset)
-                                                                .into_node(),
-                                                        ),
-                                                    )
-                                                    .into_node(),
-                                                ),
-                                            )
-                                            .into_node()
-                                        })
-                                        .collect(),
-                                )
-                                .into_node(),
-                            )))
-                            .into_node(),
-                        )
-                        .into_node();
-                        [label, ret]
-                    })
-                    .collect::<Vec<_>>(),
-            }
-            .into_node(),
-        )
-        .into_node();
-
-        let ret = StatementData::Jump(
-            JumpStatementData::Return(Some(Box::new(
-                ExprData::FloatConst(0.0).into_node(),
-            )))
-            .into_node(),
-        )
-        .into_node();
-
-        FunctionDefinitionData {
-            prototype: prototype.into_node(),
-            statement: CompoundStatementData {
-                statement_list: vec![switch, ret],
-            }
-            .into_node(),
-        }
-        .into_node()
-    }
-
-    fn generate_function_name(id: usize) -> SmolStr {
-        format!("_function{id}").into()
     }
 }
 
@@ -989,86 +556,6 @@ impl WgpuState {
         slice.get_mapped_range_mut()
     }
 }
-
-impl std::fmt::Display for FunctionSanitizeError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        use glsl_lang::transpiler::glsl::*;
-        match self {
-            | FunctionSanitizeError::InvalidReturnType { expected, found } => {
-                let mut expected_fmt = String::new();
-                let mut found_fmt = String::new();
-                show_fully_specified_type(
-                    &mut expected_fmt,
-                    expected,
-                    &mut Default::default(),
-                )?;
-                show_fully_specified_type(
-                    &mut found_fmt,
-                    found,
-                    &mut Default::default(),
-                )?;
-                write!(
-                    f,
-                    "invalid return type (expected {expected_fmt}, found {found_fmt})"
-                )
-            }
-            | FunctionSanitizeError::InvalidParameter {
-                parameter,
-                position,
-                expected_type,
-            } => {
-                let (id_fmt, type_qualifier, type_specifier) = match &parameter.content {
-                    | glsl_lang::ast::FunctionParameterDeclarationData::Named(
-                        qualifier,
-                        declarator,
-                    ) => {
-                        let mut id = String::new();
-                        show_arrayed_identifier(
-                            &mut id,
-                            &declarator.content.ident,
-                            &mut Default::default(),
-                        )?;
-                        (id, qualifier, declarator.content.ty.clone())
-                    }
-                    | glsl_lang::ast::FunctionParameterDeclarationData::Unnamed(
-                        qualifier,
-                        ty,
-                    ) => ("<anonymous>".into(), qualifier, ty.clone()),
-                };
-                let mut expected_fmt = String::new();
-                let mut qualifier_fmt = String::new();
-                let mut found_fmt = String::new();
-                show_type_specifier(
-                    &mut expected_fmt,
-                    expected_type,
-                    &mut Default::default(),
-                )?;
-                if let Some(qualifier) = type_qualifier {
-                    show_type_qualifier(
-                        &mut qualifier_fmt,
-                        &qualifier,
-                        &mut Default::default(),
-                    )?;
-                    qualifier_fmt.push(' ')
-                };
-                show_type_specifier(
-                    &mut found_fmt,
-                    &type_specifier,
-                    &mut Default::default(),
-                )?;
-
-                write!(
-                    f,
-                    "invalid parameter `{id_fmt}` in position {position} (\
-                    expected scalar `{expected_fmt}`,\
-                     found `{qualifier_fmt}{expected_fmt})`"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for FunctionSanitizeError {}
 
 #[cfg(test)]
 mod tests {
