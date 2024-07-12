@@ -380,8 +380,6 @@ fn sort_shader(shader: &mut TranslationUnit) -> Result<(), String> {
         })
         .collect::<FastHashMap<_, _>>();
 
-    dbg!(&fns);
-    dbg!(&dependencies);
     // we can only sort function definitions within our shader,
     // therefore, we discard external dependencies
     for deps in dependencies.values_mut() {
@@ -402,7 +400,6 @@ fn sort_shader(shader: &mut TranslationUnit) -> Result<(), String> {
         })
         .collect_vec();
 
-    dbg!(&edges);
     let dep_graph = DiGraph::<usize, (usize, usize), _>::from_edges(edges);
     let reverse_ordering = petgraph::algo::toposort(&dep_graph, None)
         .map_err(|cycle| fns[cycle.node_id().index()].clone())?;
