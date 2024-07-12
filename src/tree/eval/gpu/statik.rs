@@ -147,11 +147,21 @@ impl StaticEvaluator {
             });
         }
 
-        let (function_names, naga_module, workgroup_size) = generate_shader(
+        let max_workgroup_size = NonZeroUsize::try_from(
+            wgpu::Limits::default().max_compute_invocations_per_workgroup as usize,
+        )
+        .expect("max work group size must be greater than zero");
+        let workgroup_size_x = batch_size.min(max_workgroup_size).get() as u32;
+        let workgroup_size_y = (permutations.get() as u32)
+            .min(max_workgroup_size.get() as u32 / workgroup_size_x);
+        let workgroup_size = [workgroup_size_x, workgroup_size_y, 1];
+
+        let (function_names, naga_module) = generate_shader(
             functions,
             batch_size.get(),
             permutations.get(),
             max_tree_size.get(),
+            workgroup_size,
         )?;
 
         let functions = function_names.keys().map(|fun| (fun.id(), *fun)).collect();
@@ -211,15 +221,17 @@ impl WgpuState {
                 "no suitable adapter found".into(),
             ))?;
 
+        let limits = wgpu::Limits {
+            max_push_constant_size: 64,
+            max_compute_invocations_per_workgroup: workgroup_size.iter().product(),
+            ..Default::default()
+        };
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::PUSH_CONSTANTS
                     | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS,
-                required_limits: wgpu::Limits {
-                    max_push_constant_size: 64,
-                    ..Default::default()
-                },
+                required_limits: limits.clone(),
             },
             None,
         ))
@@ -248,9 +260,18 @@ impl WgpuState {
             * permutations.get()
             * size_of::<f32>()) as wgpu::BufferAddress;
 
-        let dataset_buffer_size = preimage_buffer_size + image_buffer_size;
-        let sampling_buffer_size =
-            constant_pool_buffer_size + batch_buffer_size + permutation_buffer_size;
+        let alignment = limits.min_storage_buffer_offset_alignment as wgpu::BufferAddress;
+
+        let preimage_offset = align(0, alignment);
+        let image_offset = align(preimage_offset + preimage_buffer_size, alignment);
+        let dataset_buffer_size = image_offset + image_buffer_size;
+
+        let constant_pool_offset = align(0, alignment);
+        let batch_offset =
+            align(constant_pool_offset + constant_pool_buffer_size, alignment);
+        let permutation_offset = align(batch_offset + batch_buffer_size, alignment);
+        let sampling_buffer_size = permutation_offset + permutation_buffer_size;
+
         let dataset_stage = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: dataset_buffer_size as wgpu::BufferAddress,
@@ -360,7 +381,7 @@ impl WgpuState {
                     binding: 0,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &dataset_storage,
-                        offset: 0,
+                        offset: preimage_offset,
                         size: Some(preimage_buffer_size.try_into().unwrap()),
                     }),
                 },
@@ -368,7 +389,7 @@ impl WgpuState {
                     binding: 1,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &dataset_storage,
-                        offset: preimage_buffer_size,
+                        offset: image_offset,
                         size: Some(image_buffer_size.try_into().unwrap()),
                     }),
                 },
@@ -383,7 +404,7 @@ impl WgpuState {
                     binding: 0,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &sampling_storage,
-                        offset: 0,
+                        offset: constant_pool_offset,
                         size: Some(constant_pool_buffer_size.try_into().unwrap()),
                     }),
                 },
@@ -391,7 +412,7 @@ impl WgpuState {
                     binding: 1,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &sampling_storage,
-                        offset: constant_pool_buffer_size,
+                        offset: batch_offset,
                         size: Some(batch_buffer_size.try_into().unwrap()),
                     }),
                 },
@@ -399,8 +420,8 @@ impl WgpuState {
                     binding: 2,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &sampling_storage,
-                        offset: batch_buffer_size,
-                        size: Some(batch_buffer_size.try_into().unwrap()),
+                        offset: permutation_offset,
+                        size: Some(permutation_buffer_size.try_into().unwrap()),
                     }),
                 },
             ],
@@ -439,7 +460,7 @@ impl WgpuState {
             label: None,
             layout: Some(&pipeline_layout),
             module: &shader_module,
-            entry_point: "",
+            entry_point: "main",
             compilation_options: Default::default(),
         });
 
@@ -559,13 +580,25 @@ impl WgpuState {
     }
 }
 
+impl PushConstants {
+    fn range() -> Range<u32> {
+        0..Self::std430_size_static() as u32
+    }
+}
+
+const fn align(
+    offset: wgpu::BufferAddress,
+    alignment: wgpu::BufferAddress,
+) -> wgpu::BufferAddress {
+    offset + (alignment - (offset % alignment)) % alignment
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use glsl::parser::Parse;
     use glsl::syntax::FunctionDefinition;
     use nalgebra::DMatrix;
-
-    use crate::tree::eval::gpu::statik::{StaticEvaluator, StaticEvaluatorError};
 
     fn function_defs() -> Result<Vec<FunctionDefinition>, Box<dyn std::error::Error>> {
         const FUNCTION_DEFS_TEXT: &[&str] = &[
@@ -656,10 +689,15 @@ mod tests {
         )
         .map(|_| ())
     }
-}
 
-impl PushConstants {
-    fn range() -> Range<u32> {
-        0..Self::std430_size_static() as u32
+    #[test]
+    fn test_align() {
+        assert_eq!(12, align(9, 4));
+        assert_eq!(16, align(13, 4));
+        assert_eq!(12, align(12, 4));
+        assert_eq!(13, align(13, 1));
+        assert_eq!(8, align(8, 8));
+        assert_eq!(32, align(16, 32));
+        assert_eq!(512, align(16, 512));
     }
 }

@@ -13,6 +13,8 @@ mod macro_identifiers {
         pub const CONSTANT: &str = "OPKIND_CONSTANT";
         pub const FUNCTION: &str = "OPKIND_FUNCTION";
     }
+    pub const WORKGROUP_SIZE_X: &str = "WORKGROUP_SIZE_X";
+    pub const WORKGROUP_SIZE_Y: &str = "WORKGROUP_SIZE_Y";
     pub const BATCH_SIZE: &str = "BATCH_SIZE";
     pub const PERMUTATIONS: &str = "PERMUTATIONS";
     pub const STACK_SIZE: &str = "STACK_SIZE";
@@ -26,18 +28,23 @@ pub fn generate_shader(
     batch_size: usize,
     permutations: usize,
     stack_size: usize,
+    workgroup_size: [u32; 3],
 ) -> Result<
-    (
-        FastHashMap<crate::ops::gpu::Function, String>,
-        naga::Module,
-        [u32; 3],
-    ),
+    (FastHashMap<crate::ops::gpu::Function, String>, naga::Module),
     StaticEvaluatorError,
 > {
     let defines = [
         (macro_identifiers::opkind::VARIABLE, rpn::OPKIND_VARIABLE),
         (macro_identifiers::opkind::CONSTANT, rpn::OPKIND_CONSTANT),
         (macro_identifiers::opkind::FUNCTION, batch_size),
+        (
+            macro_identifiers::WORKGROUP_SIZE_X,
+            workgroup_size[0] as usize,
+        ),
+        (
+            macro_identifiers::WORKGROUP_SIZE_Y,
+            workgroup_size[1] as usize,
+        ),
         (macro_identifiers::BATCH_SIZE, batch_size),
         (macro_identifiers::PERMUTATIONS, permutations),
         (macro_identifiers::STACK_SIZE, stack_size),
@@ -84,10 +91,13 @@ pub fn generate_shader(
     };
 
     let naga_module = naga_front.parse(&options, &shader_source)?;
-    let workgroup_size = naga_front.metadata().workgroup_size;
-    debug_assert_eq!([batch_size as u32, permutations as u32, 1], workgroup_size);
+    let actual_workgroup_size = naga_front.metadata().workgroup_size;
+    debug_assert_eq!(
+        [workgroup_size[0] as u32, workgroup_size[1] as u32, 1],
+        actual_workgroup_size
+    );
 
-    Ok((function_names, naga_module, workgroup_size))
+    Ok((function_names, naga_module))
 }
 
 fn sanitize_function_definitions(

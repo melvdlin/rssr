@@ -2,6 +2,8 @@
 
 /*  required #defines:
 
+    WORKGROUP_SIZE_X: the x dimension size of the work group
+    WORKGROUP_SIZE_Y: the y dimension size of the work group
     BATCH_SIZE: batch size; the x dimension of the work group
     PERMUTATIONS: number of permutations; the y dimension of the work group
     STACK_SIZE: size of private stack; should not be smaller than expression tree
@@ -70,7 +72,7 @@ layout (std430, push_constant) uniform PushConstants {
     uint expressionSize;
 };
 
-layout (local_size_x = BATCH_SIZE, local_size_y = PERMUTATIONS, local_size_z = 1) in;
+layout (local_size_x = WORKGROUP_SIZE_X, local_size_y = WORKGROUP_SIZE_Y, local_size_z = 1) in;
 
 float _prefactor(uint permutationIdx, uint nodeIdx);
 float _sample(uint batchIdx, uint dimension);
