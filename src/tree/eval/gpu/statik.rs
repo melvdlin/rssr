@@ -4,20 +4,20 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::mpsc;
 
-use crate::tree::eval::gpu::statik::shader::generate_shader;
 use crevice::std430::AsStd430;
-use glsl_lang::ast::{NodeContent, SmolStr};
-use glsl_lang::parse::Parsable;
 use itertools::Itertools;
 use nalgebra::DMatrix;
-use shader::FunctionSanitizeError;
 use wgpu::naga::FastHashMap;
+
+use shader::FunctionSanitizeError;
+
+use crate::tree::eval::gpu::statik::shader::generate_shader;
 
 mod shader;
 
 pub struct StaticEvaluator {
     functions: FastHashMap<usize, crate::ops::gpu::Function>,
-    function_names: FastHashMap<crate::ops::gpu::Function, SmolStr>,
+    function_names: FastHashMap<crate::ops::gpu::Function, String>,
     wgpu_state: WgpuState,
     preimage: DMatrix<f32>,
     image: Box<[f32]>,
@@ -68,7 +68,7 @@ pub enum StaticEvaluatorError {
         preimage_rows: usize,
     },
     #[error("shader contains cycle")]
-    Cycle(SmolStr),
+    Cycle(String),
     #[error("shaderc error")]
     ShaderC(#[from] Option<shaderc::Error>),
     #[error("naga error: {0}")]
@@ -76,7 +76,7 @@ pub enum StaticEvaluatorError {
     #[error("failed to sanitize functions: {0}")]
     FunctionSanitize(#[from] FunctionSanitizeError),
     #[error("WGPU error: {0}")]
-    Wgpu(SmolStr),
+    Wgpu(String),
 }
 
 mod rpn {
@@ -125,7 +125,7 @@ mod rpn {
 #[allow(unused)]
 impl StaticEvaluator {
     pub fn new(
-        functions: impl IntoIterator<Item = glsl_lang::ast::FunctionDefinition>,
+        functions: impl IntoIterator<Item = glsl::syntax::FunctionDefinition>,
         batch_size: NonZeroUsize,
         permutations: NonZeroUsize,
         max_tree_size: NonZeroUsize,
@@ -559,8 +559,8 @@ impl WgpuState {
 
 #[cfg(test)]
 mod tests {
-    use glsl_lang::ast::FunctionDefinition;
-    use glsl_lang::parse::Parsable;
+    use glsl::parser::Parse;
+    use glsl::syntax::FunctionDefinition;
     use nalgebra::DMatrix;
 
     use crate::tree::eval::gpu::statik::{StaticEvaluator, StaticEvaluatorError};
@@ -613,7 +613,7 @@ mod tests {
         Ok(FUNCTION_DEFS_TEXT
             .iter()
             .cloned()
-            .map(glsl_lang::ast::FunctionDefinition::parse)
+            .map(FunctionDefinition::parse)
             .collect::<Result<Vec<_>, _>>()?)
     }
 

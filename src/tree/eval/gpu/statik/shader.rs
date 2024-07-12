@@ -6,33 +6,25 @@ use std::fmt::Formatter;
 #[derive(Clone, Debug)]
 pub enum FunctionSanitizeError {
     InvalidReturnType {
-        expected: glsl_lang::ast::FullySpecifiedType,
-        found: glsl_lang::ast::FullySpecifiedType,
+        expected: ::glsl::syntax::FullySpecifiedType,
+        found: ::glsl::syntax::FullySpecifiedType,
     },
     InvalidParameter {
-        parameter: glsl_lang::ast::FunctionParameterDeclaration,
+        parameter: ::glsl::syntax::FunctionParameterDeclaration,
         position: usize,
-        expected_type: glsl_lang::ast::TypeSpecifier,
+        expected_type: ::glsl::syntax::TypeSpecifier,
     },
 }
 
 impl std::fmt::Display for FunctionSanitizeError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        use glsl_lang::transpiler::glsl::*;
+        use ::glsl::transpiler::glsl::*;
         match self {
             | FunctionSanitizeError::InvalidReturnType { expected, found } => {
                 let mut expected_fmt = String::new();
                 let mut found_fmt = String::new();
-                show_fully_specified_type(
-                    &mut expected_fmt,
-                    expected,
-                    &mut Default::default(),
-                )?;
-                show_fully_specified_type(
-                    &mut found_fmt,
-                    found,
-                    &mut Default::default(),
-                )?;
+                show_fully_specified_type(&mut expected_fmt, expected);
+                show_fully_specified_type(&mut found_fmt, found);
                 write!(
                     f,
                     "invalid return type (expected {expected_fmt}, found {found_fmt})"
@@ -43,20 +35,16 @@ impl std::fmt::Display for FunctionSanitizeError {
                 position,
                 expected_type,
             } => {
-                let (id_fmt, type_qualifier, type_specifier) = match &parameter.content {
-                    | glsl_lang::ast::FunctionParameterDeclarationData::Named(
+                let (id_fmt, type_qualifier, type_specifier) = match &parameter {
+                    | ::glsl::syntax::FunctionParameterDeclaration::Named(
                         qualifier,
                         declarator,
                     ) => {
                         let mut id = String::new();
-                        show_arrayed_identifier(
-                            &mut id,
-                            &declarator.content.ident,
-                            &mut Default::default(),
-                        )?;
-                        (id, qualifier, declarator.content.ty.clone())
+                        show_arrayed_identifier(&mut id, &declarator.ident);
+                        (id, qualifier, declarator.ty.clone())
                     }
-                    | glsl_lang::ast::FunctionParameterDeclarationData::Unnamed(
+                    | ::glsl::syntax::FunctionParameterDeclaration::Unnamed(
                         qualifier,
                         ty,
                     ) => ("<anonymous>".into(), qualifier, ty.clone()),
@@ -64,24 +52,12 @@ impl std::fmt::Display for FunctionSanitizeError {
                 let mut expected_fmt = String::new();
                 let mut qualifier_fmt = String::new();
                 let mut found_fmt = String::new();
-                show_type_specifier(
-                    &mut expected_fmt,
-                    expected_type,
-                    &mut Default::default(),
-                )?;
+                show_type_specifier(&mut expected_fmt, expected_type);
                 if let Some(qualifier) = type_qualifier {
-                    show_type_qualifier(
-                        &mut qualifier_fmt,
-                        &qualifier,
-                        &mut Default::default(),
-                    )?;
+                    show_type_qualifier(&mut qualifier_fmt, &qualifier);
                     qualifier_fmt.push(' ')
                 };
-                show_type_specifier(
-                    &mut found_fmt,
-                    &type_specifier,
-                    &mut Default::default(),
-                )?;
+                show_type_specifier(&mut found_fmt, &type_specifier);
 
                 write!(
                     f,

@@ -1,4 +1,4 @@
-use glsl_lang::{ast::*, parse::Parsable};
+use glsl::{parser::Parse, syntax::*};
 use itertools::Itertools;
 use naga::{FastHashMap, FastHashSet};
 use petgraph::graph::DiGraph;
@@ -29,7 +29,7 @@ pub fn generate_shader(
     stack_size: usize,
 ) -> Result<
     (
-        FastHashMap<crate::ops::gpu::Function, SmolStr>,
+        FastHashMap<crate::ops::gpu::Function, String>,
         CompilationArtifact,
     ),
     StaticEvaluatorError,
@@ -58,26 +58,21 @@ pub fn generate_shader(
         .map(|(_def, fun, name)| (*fun, name.clone()))
         .collect();
     println!("{SHADER_SOURCE}");
-    let mut shader_ast = glsl_lang::ast::TranslationUnit::parse(SHADER_SOURCE)
+    let mut shader_ast = glsl::syntax::TranslationUnit::parse(SHADER_SOURCE)
         .unwrap_or_else(|err| panic!("failed to parse shader skeleton: {err}"));
+    shader_ast.0.extend(
+        sanitized.iter().map(|(def, _fun, _name)| {
+            ExternalDeclaration::FunctionDefinition(def.clone())
+        }),
+    );
     shader_ast
         .0
-        .extend(sanitized.iter().map(|(def, _fun, _name)| {
-            ExternalDeclarationData::FunctionDefinition(def.clone()).into_node()
-        }));
-    shader_ast.0.push(
-        ExternalDeclarationData::FunctionDefinition(evaluation.clone()).into_node(),
-    );
+        .push(ExternalDeclaration::FunctionDefinition(evaluation.clone()));
 
     sort_shader(&mut shader_ast).map_err(|err| StaticEvaluatorError::Cycle(err))?;
     let shader_source = {
         let mut shader_source = String::new();
-        glsl_lang::transpiler::glsl::show_translation_unit(
-            &mut shader_source,
-            &shader_ast,
-            Default::default(),
-        )
-        .unwrap_or_else(|err| panic!("failed to render shader: {err}"));
+        glsl::transpiler::glsl::show_translation_unit(&mut shader_source, &shader_ast);
         shader_source
     };
 
@@ -151,35 +146,27 @@ pub fn generate_shader(
 }
 
 fn sanitize_function_definitions(
-    functions: impl IntoIterator<Item = glsl_lang::ast::FunctionDefinition>,
+    functions: impl IntoIterator<Item = glsl::syntax::FunctionDefinition>,
 ) -> Result<
     Vec<(
-        glsl_lang::ast::FunctionDefinition,
+        glsl::syntax::FunctionDefinition,
         crate::ops::gpu::Function,
-        SmolStr,
+        String,
     )>,
     FunctionSanitizeError,
 > {
-    use glsl_lang::ast::*;
-
     fn validate_return_type(
         function: &FunctionDefinition,
     ) -> Result<(), FunctionSanitizeError> {
         if function.prototype.ty.qualifier.is_some()
             || function.prototype.ty.ty.array_specifier.is_some()
-            || !matches!(
-                *function.prototype.ty.ty.ty,
-                TypeSpecifierNonArrayData::Float
-            )
+            || !matches!(function.prototype.ty.ty.ty, TypeSpecifierNonArray::Float)
         {
             return Err(FunctionSanitizeError::InvalidReturnType {
-                expected: FullySpecifiedTypeData {
+                expected: FullySpecifiedType {
                     qualifier: None,
-                    ty: TypeSpecifierData {
-                        ty: TypeSpecifierNonArray::new(
-                            TypeSpecifierNonArrayData::Float,
-                            None,
-                        ),
+                    ty: TypeSpecifier {
+                        ty: TypeSpecifierNonArray::Float,
                         array_specifier: None,
                     }
                     .into(),
@@ -195,24 +182,18 @@ fn sanitize_function_definitions(
         position: usize,
         parameter: &FunctionParameterDeclaration,
     ) -> Result<(), FunctionSanitizeError> {
-        let (qualifier, ty) = match &**parameter {
-            | FunctionParameterDeclarationData::Named(qualifier, declarator) => {
+        let (qualifier, ty) = match parameter {
+            | FunctionParameterDeclaration::Named(qualifier, declarator) => {
                 (qualifier, &declarator.ty)
             }
-            | FunctionParameterDeclarationData::Unnamed(qualifier, ty) => (qualifier, ty),
+            | FunctionParameterDeclaration::Unnamed(qualifier, ty) => (qualifier, ty),
         };
         if qualifier.is_some()
             || !matches!(
                 ty,
                 TypeSpecifier {
-                    content: TypeSpecifierData {
-                        ty: TypeSpecifierNonArray {
-                            content: TypeSpecifierNonArrayData::Float,
-                            ..
-                        },
-                        array_specifier: None
-                    },
-                    ..
+                    ty: TypeSpecifierNonArray::Float,
+                    array_specifier: None
                 }
             )
         {
@@ -220,14 +201,8 @@ fn sanitize_function_definitions(
                 parameter: parameter.clone(),
                 position,
                 expected_type: TypeSpecifier {
-                    content: TypeSpecifierData {
-                        ty: TypeSpecifierNonArray {
-                            content: TypeSpecifierNonArrayData::Float,
-                            span: None,
-                        },
-                        array_specifier: None,
-                    },
-                    span: None,
+                    ty: TypeSpecifierNonArray::Float,
+                    array_specifier: None,
                 },
             });
         }
@@ -257,31 +232,27 @@ fn sanitize_function_definitions(
 fn generate_function_evaluation(
     functions: impl IntoIterator<Item = crate::ops::gpu::Function>,
     stack_size: usize,
-) -> glsl_lang::ast::FunctionDefinition {
-    use glsl_lang::ast::*;
+) -> glsl::syntax::FunctionDefinition {
+    use glsl::syntax::*;
 
     fn parameter_declaration(
         ident: Identifier,
-        ty: TypeSpecifierNonArrayData,
-        array: Option<ArraySpecifierData>,
+        ty: TypeSpecifierNonArray,
+        array: Option<ArraySpecifier>,
     ) -> FunctionParameterDeclaration {
-        FunctionParameterDeclarationData::Named(
+        FunctionParameterDeclaration::Named(
             None,
-            FunctionParameterDeclaratorData {
-                ty: TypeSpecifierData {
-                    ty: ty.into_node(),
+            FunctionParameterDeclarator {
+                ty: TypeSpecifier {
+                    ty,
                     array_specifier: None,
-                }
-                .into_node(),
-                ident: ArrayedIdentifierData {
+                },
+                ident: ArrayedIdentifier {
                     ident,
-                    array_spec: array.map(Node::from),
-                }
-                .into_node(),
-            }
-            .into_node(),
+                    array_spec: array,
+                },
+            },
         )
-        .into_node()
     }
 
     // prototype:
@@ -289,37 +260,30 @@ fn generate_function_evaluation(
     // functions to call:
     // `float _functionXYZ(float p1, float p2, ..., float pn)`
 
-    let function_ident = IdentifierData::from("_function").into_node();
-    let id_param_ident: Identifier = IdentifierData::from("id").into_node();
-    let sp_param_ident: Identifier = IdentifierData::from("sp").into_node();
-    let stack_param_ident: Identifier = IdentifierData::from("stack").into_node();
-    let id_param = parameter_declaration(
-        id_param_ident.clone(),
-        TypeSpecifierNonArrayData::UInt,
-        None,
-    );
-    let sp_param = parameter_declaration(
-        sp_param_ident.clone(),
-        TypeSpecifierNonArrayData::UInt,
-        None,
-    );
+    let function_ident = Identifier::from("_function");
+    let id_param_ident: Identifier = Identifier::from("id");
+    let sp_param_ident: Identifier = Identifier::from("sp");
+    let stack_param_ident: Identifier = Identifier::from("stack");
+    let id_param =
+        parameter_declaration(id_param_ident.clone(), TypeSpecifierNonArray::UInt, None);
+    let sp_param =
+        parameter_declaration(sp_param_ident.clone(), TypeSpecifierNonArray::UInt, None);
 
     let stack_param = parameter_declaration(
         stack_param_ident.clone(),
-        TypeSpecifierNonArrayData::Float,
-        Some(ArraySpecifierData {
-            dimensions: vec![ArraySpecifierDimensionData::ExplicitlySized(Box::new(
-                ExprData::UIntConst(stack_size as u32).into_node(),
-            ))
-            .into_node()],
+        TypeSpecifierNonArray::Float,
+        Some(ArraySpecifier {
+            dimensions: NonEmpty(vec![ArraySpecifierDimension::ExplicitlySized(
+                Box::new(Expr::UIntConst(stack_size as u32)),
+            )]),
         }),
     );
 
-    let prototype = FunctionPrototypeData {
-        ty: FullySpecifiedTypeData {
+    let prototype = FunctionPrototype {
+        ty: FullySpecifiedType {
             qualifier: None,
-            ty: TypeSpecifierData {
-                ty: TypeSpecifierNonArrayData::Float.into_node(),
+            ty: TypeSpecifier {
+                ty: TypeSpecifierNonArray::Float,
                 array_specifier: None,
             }
             .into(),
@@ -329,104 +293,75 @@ fn generate_function_evaluation(
         parameters: vec![id_param, sp_param, stack_param],
     };
 
-    let switch = StatementData::Switch(
-        SwitchStatementData {
-            head: Box::new(ExprData::variable(id_param_ident).into_node()),
-            body: functions
-                .into_iter()
-                .flat_map(|function| {
-                    let id = function.id;
-                    let arity = function.arity as u32;
-                    let ident = IdentifierData(generate_function_name(id)).into_node();
+    let switch = Statement::Simple(Box::new(SimpleStatement::Switch(SwitchStatement {
+        head: Box::new(Expr::Variable(id_param_ident)),
+        body: functions
+            .into_iter()
+            .flat_map(|function| {
+                let id = function.id;
+                let arity = function.arity as u32;
+                let ident = Identifier(generate_function_name(id));
 
-                    let label = StatementData::CaseLabel(
-                        CaseLabelData::Case(Box::new(
-                            ExprData::UIntConst(id as u32).into_node(),
-                        ))
-                        .into_node(),
-                    )
-                    .into_node();
+                let label = Statement::Simple(Box::new(SimpleStatement::CaseLabel(
+                    CaseLabel::Case(Box::new(Expr::UIntConst(id as u32))),
+                )));
 
-                    let ret = StatementData::Jump(
-                        JumpStatementData::Return(Some(Box::new(
-                            ExprData::FunCall(
-                                FunIdentifierData::Expr(Box::new(
-                                    ExprData::variable(ident).into_node(),
-                                ))
-                                .into_node(),
-                                (1..=arity)
-                                    .map(|offset| {
-                                        ExprData::Bracket(
-                                            Box::new(
-                                                ExprData::variable(
-                                                    stack_param_ident.clone(),
-                                                )
-                                                .into_node(),
+                let ret = Statement::Simple(Box::new(SimpleStatement::Jump(
+                    JumpStatement::Return(Some(Box::new(Expr::FunCall(
+                        FunIdentifier::Expr(Box::new(Expr::Variable(ident))),
+                        (1..=arity)
+                            .map(|offset| {
+                                Expr::Bracket(
+                                    Box::new(Expr::Variable(stack_param_ident.clone())),
+                                    ArraySpecifier {
+                                        dimensions: NonEmpty(vec![
+                                            ArraySpecifierDimension::ExplicitlySized(
+                                                Box::new(Expr::Binary(
+                                                    BinaryOp::Sub,
+                                                    Box::new(Expr::Variable(
+                                                        sp_param_ident.clone(),
+                                                    )),
+                                                    Box::new(Expr::UIntConst(offset)),
+                                                )),
                                             ),
-                                            Box::new(
-                                                ExprData::Binary(
-                                                    BinaryOpData::Sub.into_node(),
-                                                    Box::new(
-                                                        ExprData::variable(
-                                                            sp_param_ident.clone(),
-                                                        )
-                                                        .into_node(),
-                                                    ),
-                                                    Box::new(
-                                                        ExprData::UIntConst(offset)
-                                                            .into_node(),
-                                                    ),
-                                                )
-                                                .into_node(),
-                                            ),
-                                        )
-                                        .into_node()
-                                    })
-                                    .collect(),
-                            )
-                            .into_node(),
-                        )))
-                        .into_node(),
-                    )
-                    .into_node();
-                    [label, ret]
-                })
-                .collect::<Vec<_>>(),
-        }
-        .into_node(),
-    )
-    .into_node();
+                                        ]),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    )))),
+                )));
+                [label, ret]
+            })
+            .collect::<Vec<_>>(),
+    })));
 
-    let ret = StatementData::Jump(
-        JumpStatementData::Return(Some(Box::new(ExprData::FloatConst(0.0).into_node())))
-            .into_node(),
-    )
-    .into_node();
+    let ret = Statement::Simple(Box::new(SimpleStatement::Jump(JumpStatement::Return(
+        Some(Box::new(Expr::FloatConst(0.0))),
+    ))));
 
-    FunctionDefinitionData {
-        prototype: prototype.into_node(),
-        statement: CompoundStatementData {
+    FunctionDefinition {
+        prototype,
+        statement: CompoundStatement {
             statement_list: vec![switch, ret],
-        }
-        .into_node(),
+        },
     }
-    .into_node()
 }
 
-fn generate_function_name(id: usize) -> SmolStr {
+fn generate_function_name(id: usize) -> String {
     format!("_function{id}").into()
 }
 
 /// Topoligically sort declared functions.
 /// Overloading is not supported.
 /// Functions will be placed after all other declarations.
-fn sort_shader(shader: &mut TranslationUnit) -> Result<(), SmolStr> {
+fn sort_shader(shader: &mut TranslationUnit) -> Result<(), String> {
     // we only sort function definitions, no other declarations
-    let mut non_fn_decls = Vec::with_capacity(shader.0.len());
+    let mut non_fn_decls = Vec::with_capacity(shader.0 .0.len());
     let mut fn_decls =
-        FastHashMap::with_capacity_and_hasher(shader.0.len(), Default::default());
-    for decl in std::mem::take(&mut shader.0) {
-        if let ExternalDeclarationData::FunctionDefinition(def) = decl.content {
+        FastHashMap::with_capacity_and_hasher(shader.0 .0.len(), Default::default());
+    for decl in std::mem::take(&mut shader.0 .0) {
+        if let ExternalDeclaration::FunctionDefinition(def) = decl {
             fn_decls.insert(def.prototype.name.0.clone(), def);
         } else {
             non_fn_decls.push(decl);
@@ -485,93 +420,93 @@ fn sort_shader(shader: &mut TranslationUnit) -> Result<(), SmolStr> {
 
     let mut decls = non_fn_decls;
     decls.extend(
-        ordered_fn_decls.map(|fn_decl| {
-            Node::from(ExternalDeclarationData::FunctionDefinition(fn_decl))
-        }),
+        ordered_fn_decls.map(|fn_decl| ExternalDeclaration::FunctionDefinition(fn_decl)),
     );
 
-    shader.0 = decls;
+    shader.0 .0 = decls;
 
     Ok(())
 }
 
-fn find_stmt_deps(stmt: &Statement, deps: &mut FastHashSet<SmolStr>) {
-    match &stmt.content {
-        | StatementData::Declaration(_) => {}
-        | StatementData::Expression(expr) => {
-            if let Some(expr) = &expr.content.0.as_ref() {
-                find_expr_deps(expr, deps);
-            }
-        }
-        | StatementData::Selection(selection) => {
-            find_expr_deps(&selection.cond, deps);
-            match &selection.rest.content {
-                | SelectionRestStatementData::Statement(expr) => {
-                    find_stmt_deps(expr, deps)
-                }
-                | SelectionRestStatementData::Else(iph, els) => {
-                    find_stmt_deps(iph, deps);
-                    find_stmt_deps(els, deps);
-                }
-            }
-        }
-        | StatementData::Switch(switch) => {
-            find_expr_deps(&switch.head, deps);
-            for stmt in &switch.body {
-                find_stmt_deps(stmt, deps);
-            }
-        }
-        | StatementData::CaseLabel(case_label) => {
-            if let CaseLabelData::Case(expr) = &case_label.content {
-                find_expr_deps(expr, deps);
-            }
-        }
-        | StatementData::Iteration(iteration) => match &iteration.content {
-            | IterationStatementData::While(condition, stmt) => {
-                match &condition.content {
-                    | ConditionData::Expr(expr) => find_expr_deps(expr, deps),
-                    | ConditionData::Assignment(_, _, initializer) => {
-                        find_initializer_deps(initializer, deps);
-                    }
-                }
-                find_stmt_deps(stmt, deps);
-            }
-            | IterationStatementData::DoWhile(stmt, expr) => {
-                find_stmt_deps(stmt, deps);
-                find_expr_deps(expr, deps);
-            }
-            | IterationStatementData::For(init, rest, stmt) => {
-                match &init.content {
-                    | ForInitStatementData::Expression(Some(expr)) => {
-                        find_expr_deps(expr, deps)
-                    }
-                    | ForInitStatementData::Expression(None) => {}
-                    | ForInitStatementData::Declaration(decl) => {
-                        find_declaration_deps(decl, deps)
-                    }
-                }
-                if let Some(condition) = rest.condition.as_ref() {
-                    match &condition.content {
-                        | ConditionData::Expr(expr) => find_expr_deps(expr, deps),
-                        | ConditionData::Assignment(_, _, initializer) => {
-                            find_initializer_deps(initializer, deps)
-                        }
-                    }
-                }
-                if let Some(expr) = rest.post_expr.as_ref() {
+fn find_stmt_deps(stmt: &Statement, deps: &mut FastHashSet<String>) {
+    match stmt {
+        | Statement::Simple(simple) => match &**simple {
+            | SimpleStatement::Declaration(_) => {}
+            | SimpleStatement::Expression(expr) => {
+                if let Some(expr) = &expr.as_ref() {
                     find_expr_deps(expr, deps);
                 }
-                find_stmt_deps(stmt, deps);
             }
+            | SimpleStatement::Selection(selection) => {
+                find_expr_deps(&selection.cond, deps);
+                match &selection.rest {
+                    | SelectionRestStatement::Statement(expr) => {
+                        find_stmt_deps(expr, deps)
+                    }
+                    | SelectionRestStatement::Else(iph, els) => {
+                        find_stmt_deps(iph, deps);
+                        find_stmt_deps(els, deps);
+                    }
+                }
+            }
+            | SimpleStatement::Switch(switch) => {
+                find_expr_deps(&switch.head, deps);
+                for stmt in &switch.body {
+                    find_stmt_deps(stmt, deps);
+                }
+            }
+            | SimpleStatement::CaseLabel(case_label) => {
+                if let CaseLabel::Case(expr) = &case_label {
+                    find_expr_deps(&expr, deps);
+                }
+            }
+            | SimpleStatement::Iteration(iteration) => match &iteration {
+                | IterationStatement::While(condition, stmt) => {
+                    match &condition {
+                        | Condition::Expr(expr) => find_expr_deps(expr, deps),
+                        | Condition::Assignment(_, _, initializer) => {
+                            find_initializer_deps(initializer, deps);
+                        }
+                    }
+                    find_stmt_deps(stmt, deps);
+                }
+                | IterationStatement::DoWhile(stmt, expr) => {
+                    find_stmt_deps(stmt, deps);
+                    find_expr_deps(expr, deps);
+                }
+                | IterationStatement::For(init, rest, stmt) => {
+                    match &init {
+                        | ForInitStatement::Expression(Some(expr)) => {
+                            find_expr_deps(expr, deps)
+                        }
+                        | ForInitStatement::Expression(None) => {}
+                        | ForInitStatement::Declaration(decl) => {
+                            find_declaration_deps(decl, deps)
+                        }
+                    }
+                    if let Some(condition) = rest.condition.as_ref() {
+                        match &condition {
+                            | Condition::Expr(expr) => find_expr_deps(expr, deps),
+                            | Condition::Assignment(_, _, initializer) => {
+                                find_initializer_deps(initializer, deps)
+                            }
+                        }
+                    }
+                    if let Some(expr) = rest.post_expr.as_ref() {
+                        find_expr_deps(expr, deps);
+                    }
+                    find_stmt_deps(stmt, deps);
+                }
+            },
+            | SimpleStatement::Jump(jump) => match &jump {
+                | JumpStatement::Continue => {}
+                | JumpStatement::Break => {}
+                | JumpStatement::Return(Some(expr)) => find_expr_deps(expr, deps),
+                | JumpStatement::Return(None) => {}
+                | JumpStatement::Discard => {}
+            },
         },
-        | StatementData::Jump(jump) => match &jump.content {
-            | JumpStatementData::Continue => {}
-            | JumpStatementData::Break => {}
-            | JumpStatementData::Return(Some(expr)) => find_expr_deps(expr, deps),
-            | JumpStatementData::Return(None) => {}
-            | JumpStatementData::Discard => {}
-        },
-        | StatementData::Compound(compound) => {
+        | Statement::Compound(compound) => {
             for stmt in &compound.statement_list {
                 find_stmt_deps(stmt, deps);
             }
@@ -579,35 +514,42 @@ fn find_stmt_deps(stmt: &Statement, deps: &mut FastHashSet<SmolStr>) {
     }
 }
 
-fn find_expr_deps(expr: &Expr, deps: &mut FastHashSet<SmolStr>) {
-    match &expr.content {
-        | ExprData::Variable(_ident) => {}
-        | ExprData::IntConst(_value) => {}
-        | ExprData::UIntConst(_value) => {}
-        | ExprData::BoolConst(_value) => {}
-        | ExprData::FloatConst(_value) => {}
-        | ExprData::DoubleConst(_value) => {}
-        | ExprData::Unary(_op, expr) => find_expr_deps(expr, deps),
-        | ExprData::Binary(_op, lhs, rhs) => {
+fn find_expr_deps(expr: &Expr, deps: &mut FastHashSet<String>) {
+    match expr {
+        | Expr::Variable(_ident) => {}
+        | Expr::IntConst(_value) => {}
+        | Expr::UIntConst(_value) => {}
+        | Expr::BoolConst(_value) => {}
+        | Expr::FloatConst(_value) => {}
+        | Expr::DoubleConst(_value) => {}
+        | Expr::Unary(_op, expr) => find_expr_deps(expr, deps),
+        | Expr::Binary(_op, lhs, rhs) => {
             find_expr_deps(lhs, deps);
             find_expr_deps(rhs, deps);
         }
-        | ExprData::Ternary(cond, iph, els) => {
+        | Expr::Ternary(cond, iph, els) => {
             find_expr_deps(cond, deps);
             find_expr_deps(iph, deps);
             find_expr_deps(els, deps);
         }
-        | ExprData::Assignment(lhs, _op, rhs) => {
+        | Expr::Assignment(lhs, _op, rhs) => {
             find_expr_deps(lhs, deps);
             find_expr_deps(rhs, deps);
         }
-        | ExprData::Bracket(lhs, rhs) => {
+        | Expr::Bracket(lhs, rhs) => {
             find_expr_deps(lhs, deps);
-            find_expr_deps(rhs, deps);
+            for dimension in &rhs.dimensions.0 {
+                match dimension {
+                    | ArraySpecifierDimension::ExplicitlySized(dimension) => {
+                        find_expr_deps(dimension, deps);
+                    }
+                    | ArraySpecifierDimension::Unsized => {}
+                }
+            }
         }
-        | ExprData::FunCall(ident, exprs) => {
-            if let FunIdentifierData::Expr(expr) = &ident.content {
-                if let ExprData::Variable(ident) = &expr.content {
+        | Expr::FunCall(ident, exprs) => {
+            if let FunIdentifier::Expr(expr) = &ident {
+                if let Expr::Variable(ident) = &**expr {
                     deps.insert(ident.0.clone());
                 }
             }
@@ -615,20 +557,20 @@ fn find_expr_deps(expr: &Expr, deps: &mut FastHashSet<SmolStr>) {
                 find_expr_deps(expr, deps);
             }
         }
-        | ExprData::Dot(expr, _field_ident) => find_expr_deps(expr, deps),
-        | ExprData::PostInc(expr) => find_expr_deps(expr, deps),
-        | ExprData::PostDec(expr) => find_expr_deps(expr, deps),
-        | ExprData::Comma(lhs, rhs) => {
+        | Expr::Dot(expr, _field_ident) => find_expr_deps(expr, deps),
+        | Expr::PostInc(expr) => find_expr_deps(expr, deps),
+        | Expr::PostDec(expr) => find_expr_deps(expr, deps),
+        | Expr::Comma(lhs, rhs) => {
             find_expr_deps(lhs, deps);
             find_expr_deps(rhs, deps);
         }
     }
 }
 
-fn find_initializer_deps(initializer: &Initializer, deps: &mut FastHashSet<SmolStr>) {
-    match &initializer.content {
-        | InitializerData::Simple(expr) => find_expr_deps(expr, deps),
-        | InitializerData::List(initializers) => {
+fn find_initializer_deps(initializer: &Initializer, deps: &mut FastHashSet<String>) {
+    match &initializer {
+        | Initializer::Simple(expr) => find_expr_deps(expr, deps),
+        | Initializer::List(initializers) => {
             for initializer in initializers {
                 find_initializer_deps(initializer, deps);
             }
@@ -636,10 +578,10 @@ fn find_initializer_deps(initializer: &Initializer, deps: &mut FastHashSet<SmolS
     }
 }
 
-fn find_declaration_deps(declaration: &Declaration, deps: &mut FastHashSet<SmolStr>) {
-    match &declaration.content {
-        | DeclarationData::FunctionPrototype(_prototype) => {}
-        | DeclarationData::InitDeclaratorList(declarators) => {
+fn find_declaration_deps(declaration: &Declaration, deps: &mut FastHashSet<String>) {
+    match &declaration {
+        | Declaration::FunctionPrototype(_prototype) => {}
+        | Declaration::InitDeclaratorList(declarators) => {
             if let Some(initializer) = declarators.head.initializer.as_ref() {
                 find_initializer_deps(initializer, deps);
             }
@@ -649,13 +591,13 @@ fn find_declaration_deps(declaration: &Declaration, deps: &mut FastHashSet<SmolS
                 }
             }
         }
-        | DeclarationData::Precision(_precision_qualifier, _type_specifier) => {}
-        | DeclarationData::Block(_block) => {}
-        | DeclarationData::Invariant(_ident) => {}
+        | Declaration::Precision(_precision_qualifier, _type_specifier) => {}
+        | Declaration::Block(_block) => {}
+        | Declaration::Global(_qualifier, _idents) => {}
     }
 }
 
-fn find_function_dependencies(def: &FunctionDefinition) -> FastHashSet<SmolStr> {
+fn find_function_dependencies(def: &FunctionDefinition) -> FastHashSet<String> {
     let mut deps = FastHashSet::default();
     for stmt in &def.statement.statement_list {
         find_stmt_deps(stmt, &mut deps)
