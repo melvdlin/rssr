@@ -54,7 +54,7 @@ impl std::fmt::Display for FunctionSanitizeError {
                 let mut found_fmt = String::new();
                 show_type_specifier(&mut expected_fmt, expected_type);
                 if let Some(qualifier) = type_qualifier {
-                    show_type_qualifier(&mut qualifier_fmt, &qualifier);
+                    show_type_qualifier(&mut qualifier_fmt, qualifier);
                     qualifier_fmt.push(' ')
                 };
                 show_type_specifier(&mut found_fmt, &type_specifier);

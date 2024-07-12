@@ -2,7 +2,6 @@ use glsl::{parser::Parse, syntax::*};
 use itertools::Itertools;
 use naga::{FastHashMap, FastHashSet};
 use petgraph::graph::DiGraph;
-use shaderc::CompilationArtifact;
 
 use crate::tree::eval::gpu::statik::{
     rpn, shader::FunctionSanitizeError, StaticEvaluatorError,
@@ -30,7 +29,8 @@ pub fn generate_shader(
 ) -> Result<
     (
         FastHashMap<crate::ops::gpu::Function, String>,
-        CompilationArtifact,
+        naga::Module,
+        [u32; 3],
     ),
     StaticEvaluatorError,
 > {
@@ -44,7 +44,7 @@ pub fn generate_shader(
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value.to_string()))
-    .collect_vec();
+    .collect::<FastHashMap<_, _>>();
 
     let sanitized = sanitize_function_definitions(functions)?;
 
@@ -57,7 +57,7 @@ pub fn generate_shader(
         .iter()
         .map(|(_def, fun, name)| (*fun, name.clone()))
         .collect();
-    println!("{SHADER_SOURCE}");
+
     let mut shader_ast = glsl::syntax::TranslationUnit::parse(SHADER_SOURCE)
         .unwrap_or_else(|err| panic!("failed to parse shader skeleton: {err}"));
     shader_ast.0.extend(
@@ -69,6 +69,7 @@ pub fn generate_shader(
         .0
         .push(ExternalDeclaration::FunctionDefinition(evaluation.clone()));
 
+    remove_forward_declarations(&mut shader_ast);
     sort_shader(&mut shader_ast).map_err(StaticEvaluatorError::Cycle)?;
     let shader_source = {
         let mut shader_source = String::new();
@@ -76,73 +77,17 @@ pub fn generate_shader(
         shader_source
     };
 
-    let compiler = shaderc::Compiler::new().ok_or(StaticEvaluatorError::ShaderC(None))?;
-    let mut options =
-        shaderc::CompileOptions::new().ok_or(StaticEvaluatorError::ShaderC(None))?;
-    options.set_optimization_level(shaderc::OptimizationLevel::Performance);
-    options.set_source_language(shaderc::SourceLanguage::GLSL);
-    // options.set_generate_debug_info();
-    options.set_target_spirv(shaderc::SpirvVersion::V1_6);
-    options.set_target_env(
-        shaderc::TargetEnv::Vulkan,
-        shaderc::EnvVersion::Vulkan1_3 as u32,
-    );
+    let mut naga_front = naga::front::glsl::Frontend::default();
+    let options = naga::front::glsl::Options {
+        stage: naga::ShaderStage::Compute,
+        defines,
+    };
 
-    for (symbol, definition) in defines {
-        options.add_macro_definition(&symbol, Some(&definition))
-    }
+    let naga_module = naga_front.parse(&options, &shader_source)?;
+    let workgroup_size = naga_front.metadata().workgroup_size;
+    debug_assert_eq!([batch_size as u32, permutations as u32, 1], workgroup_size);
 
-    println!("{shader_source}");
-    let artifact = compiler.compile_into_spirv(
-        &shader_source,
-        shaderc::ShaderKind::Compute,
-        "processed_skeleton.comp",
-        "main",
-        Some(&options),
-    )?;
-
-    let text = compiler.compile_into_spirv_assembly(
-        &shader_source,
-        shaderc::ShaderKind::Compute,
-        "processed_skeleton.comp",
-        "main",
-        Some(&options),
-    )?;
-
-    // println!("{}", text.as_text());
-
-    // let mut binary = artifact.as_binary().iter().copied();
-    // let magic_number = binary.next().unwrap();
-    // let version = binary.next().unwrap();
-    // let generator_magic_number = binary.next().unwrap();
-    // let bound = binary.next().unwrap();
-    // binary.next();
-    // let mut instructions = Vec::new();
-    // while let Some(inst) = binary.next() {
-    //     let op = inst as u16;
-    //     let wc = (inst >> 16) as u16;
-    //     let operands = binary.by_ref().take(wc as usize - 1).collect_vec();
-    //     instructions.push((op, wc, operands));
-    // }
-    // println!("---------------------");
-    // println!("magic number:           {magic_number}");
-    // println!("version:                {version}");
-    // println!("generator magic number: {generator_magic_number}");
-    // println!("bound:                  {bound}");
-    // println!(
-    //     "{}",
-    //     instructions
-    //         .into_iter()
-    //         .map(|(op, wc, operands)| format!(
-    //             "OP: {:04x}, WC: {:04x}; Operands: {}",
-    //             op,
-    //             wc,
-    //             operands.iter().map(|op| format!("{:08x}", op)).join(", ")
-    //         ))
-    //         .join("\n")
-    // );
-
-    Ok((function_names, artifact))
+    Ok((function_names, naga_module, workgroup_size))
 }
 
 fn sanitize_function_definitions(
@@ -342,6 +287,23 @@ fn generate_function_evaluation(
 
 fn generate_function_name(id: usize) -> String {
     format!("_function{id}")
+}
+
+/// Removes forward declarations of functions.
+fn remove_forward_declarations(shader: &mut TranslationUnit) {
+    let stmts = std::mem::take(&mut shader.0 .0);
+
+    let filtered = stmts
+        .into_iter()
+        .filter(|stmt| {
+            !matches!(
+                stmt,
+                ExternalDeclaration::Declaration(Declaration::FunctionPrototype(_))
+            )
+        })
+        .collect_vec();
+
+    shader.0 .0 = filtered;
 }
 
 /// Topoligically sort declared functions.

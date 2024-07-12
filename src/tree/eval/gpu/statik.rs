@@ -147,7 +147,7 @@ impl StaticEvaluator {
             });
         }
 
-        let (function_names, artifact) = generate_shader(
+        let (function_names, naga_module, workgroup_size) = generate_shader(
             functions,
             batch_size.get(),
             permutations.get(),
@@ -163,7 +163,8 @@ impl StaticEvaluator {
             permutations,
             max_tree_size,
             constant_pool_size,
-            artifact.as_binary(),
+            naga_module,
+            workgroup_size,
         )?;
 
         Ok(Self {
@@ -178,6 +179,7 @@ impl StaticEvaluator {
 }
 
 impl WgpuState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         preimage: &DMatrix<f32>,
         image: &[f32],
@@ -185,7 +187,8 @@ impl WgpuState {
         permutations: NonZeroUsize,
         max_tree_size: NonZeroUsize,
         constant_pool_size: NonZeroUsize,
-        spirv: &[u32],
+        naga_module: naga::Module,
+        workgroup_size: [u32; 3],
     ) -> Result<Self, StaticEvaluatorError> {
         assert!(!preimage.is_empty());
         assert!(!image.is_empty());
@@ -221,13 +224,12 @@ impl WgpuState {
             None,
         ))
         .map_err(|err| {
-            StaticEvaluatorError::Wgpu(format!("device request failed: {err}").into())
+            StaticEvaluatorError::Wgpu(format!("device request failed: {err}"))
         })?;
 
-        let workgroup_size = [batch_size.get() as u32, permutations.get() as u32, 1];
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::SpirV(Cow::Borrowed(spirv)),
+            source: wgpu::ShaderSource::Naga(Cow::Owned(naga_module)),
         });
 
         let preimage_buffer_size =
@@ -329,7 +331,7 @@ impl WgpuState {
                 label: None,
                 entries: &[
                     bind_group_layout_entry(0, preimage_buffer_size, true),
-                    bind_group_layout_entry(1, preimage_buffer_size, true),
+                    bind_group_layout_entry(1, image_buffer_size, true),
                 ],
             });
         let sampling_bind_group_layout =
