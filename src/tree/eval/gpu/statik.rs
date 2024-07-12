@@ -613,6 +613,7 @@ mod tests {
         Ok(FUNCTION_DEFS_TEXT
             .iter()
             .cloned()
+            .map(str::trim)
             .map(FunctionDefinition::parse)
             .collect::<Result<Vec<_>, _>>()?)
     }

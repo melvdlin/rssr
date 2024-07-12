@@ -69,7 +69,7 @@ pub fn generate_shader(
         .0
         .push(ExternalDeclaration::FunctionDefinition(evaluation.clone()));
 
-    sort_shader(&mut shader_ast).map_err(|err| StaticEvaluatorError::Cycle(err))?;
+    sort_shader(&mut shader_ast).map_err(StaticEvaluatorError::Cycle)?;
     let shader_source = {
         let mut shader_source = String::new();
         glsl::transpiler::glsl::show_translation_unit(&mut shader_source, &shader_ast);
@@ -92,6 +92,7 @@ pub fn generate_shader(
         options.add_macro_definition(&symbol, Some(&definition))
     }
 
+    println!("{shader_source}");
     let artifact = compiler.compile_into_spirv(
         &shader_source,
         shaderc::ShaderKind::Compute,
@@ -108,7 +109,6 @@ pub fn generate_shader(
         Some(&options),
     )?;
 
-    println!("{shader_source}");
     // println!("{}", text.as_text());
 
     // let mut binary = artifact.as_binary().iter().copied();
@@ -146,13 +146,9 @@ pub fn generate_shader(
 }
 
 fn sanitize_function_definitions(
-    functions: impl IntoIterator<Item = glsl::syntax::FunctionDefinition>,
+    functions: impl IntoIterator<Item = FunctionDefinition>,
 ) -> Result<
-    Vec<(
-        glsl::syntax::FunctionDefinition,
-        crate::ops::gpu::Function,
-        String,
-    )>,
+    Vec<(FunctionDefinition, crate::ops::gpu::Function, String)>,
     FunctionSanitizeError,
 > {
     fn validate_return_type(
@@ -168,10 +164,8 @@ fn sanitize_function_definitions(
                     ty: TypeSpecifier {
                         ty: TypeSpecifierNonArray::Float,
                         array_specifier: None,
-                    }
-                    .into(),
-                }
-                .into(),
+                    },
+                },
                 found: function.prototype.ty.clone(),
             });
         }
@@ -232,7 +226,7 @@ fn sanitize_function_definitions(
 fn generate_function_evaluation(
     functions: impl IntoIterator<Item = crate::ops::gpu::Function>,
     stack_size: usize,
-) -> glsl::syntax::FunctionDefinition {
+) -> FunctionDefinition {
     use glsl::syntax::*;
 
     fn parameter_declaration(
@@ -285,10 +279,8 @@ fn generate_function_evaluation(
             ty: TypeSpecifier {
                 ty: TypeSpecifierNonArray::Float,
                 array_specifier: None,
-            }
-            .into(),
-        }
-        .into(),
+            },
+        },
         name: function_ident,
         parameters: vec![id_param, sp_param, stack_param],
     };
@@ -349,7 +341,7 @@ fn generate_function_evaluation(
 }
 
 fn generate_function_name(id: usize) -> String {
-    format!("_function{id}").into()
+    format!("_function{id}")
 }
 
 /// Topoligically sort declared functions.
@@ -383,13 +375,15 @@ fn sort_shader(shader: &mut TranslationUnit) -> Result<(), String> {
         .iter()
         .map(|(name, def)| {
             let name = name.clone();
-            let deps = find_function_dependencies(def);
+            let deps = find_function_deps(def);
             (name, deps)
         })
         .collect::<FastHashMap<_, _>>();
 
+    dbg!(&fns);
+    dbg!(&dependencies);
     // we can only sort function definitions within our shader,
-    // therefore we discard external dependencies
+    // therefore, we discard external dependencies
     for deps in dependencies.values_mut() {
         deps.retain(|dep| fns.contains(dep));
     }
@@ -408,20 +402,19 @@ fn sort_shader(shader: &mut TranslationUnit) -> Result<(), String> {
         })
         .collect_vec();
 
+    dbg!(&edges);
     let dep_graph = DiGraph::<usize, (usize, usize), _>::from_edges(edges);
-    let ordering = petgraph::algo::toposort(&dep_graph, None)
+    let reverse_ordering = petgraph::algo::toposort(&dep_graph, None)
         .map_err(|cycle| fns[cycle.node_id().index()].clone())?;
 
-    let ordered_fn_decls = ordering.iter().map(|id| {
+    let ordered_fn_decls = reverse_ordering.iter().rev().map(|id| {
         fn_decls
             .remove(&fns[id.index()])
             .expect("function ordering should contain no duplicates")
     });
 
     let mut decls = non_fn_decls;
-    decls.extend(
-        ordered_fn_decls.map(|fn_decl| ExternalDeclaration::FunctionDefinition(fn_decl)),
-    );
+    decls.extend(ordered_fn_decls.map(ExternalDeclaration::FunctionDefinition));
 
     shader.0 .0 = decls;
 
@@ -431,7 +424,9 @@ fn sort_shader(shader: &mut TranslationUnit) -> Result<(), String> {
 fn find_stmt_deps(stmt: &Statement, deps: &mut FastHashSet<String>) {
     match stmt {
         | Statement::Simple(simple) => match &**simple {
-            | SimpleStatement::Declaration(_) => {}
+            | SimpleStatement::Declaration(decl) => {
+                find_declaration_deps(decl, deps);
+            }
             | SimpleStatement::Expression(expr) => {
                 if let Some(expr) = &expr.as_ref() {
                     find_expr_deps(expr, deps);
@@ -455,11 +450,10 @@ fn find_stmt_deps(stmt: &Statement, deps: &mut FastHashSet<String>) {
                     find_stmt_deps(stmt, deps);
                 }
             }
-            | SimpleStatement::CaseLabel(case_label) => {
-                if let CaseLabel::Case(expr) = &case_label {
-                    find_expr_deps(&expr, deps);
-                }
-            }
+            | SimpleStatement::CaseLabel(case_label) => match case_label {
+                | CaseLabel::Case(expr) => find_expr_deps(expr, deps),
+                | CaseLabel::Def => {}
+            },
             | SimpleStatement::Iteration(iteration) => match &iteration {
                 | IterationStatement::While(condition, stmt) => {
                     match &condition {
@@ -548,8 +542,15 @@ fn find_expr_deps(expr: &Expr, deps: &mut FastHashSet<String>) {
             }
         }
         | Expr::FunCall(ident, exprs) => {
-            if let FunIdentifier::Expr(expr) = &ident {
-                if let Expr::Variable(ident) = &**expr {
+            match ident {
+                | FunIdentifier::Expr(expr) => {
+                    if let Expr::Variable(ident) = &**expr {
+                        deps.insert(ident.0.clone());
+                    } else {
+                        find_expr_deps(expr, deps);
+                    }
+                }
+                | FunIdentifier::Identifier(ident) => {
                     deps.insert(ident.0.clone());
                 }
             }
@@ -597,7 +598,7 @@ fn find_declaration_deps(declaration: &Declaration, deps: &mut FastHashSet<Strin
     }
 }
 
-fn find_function_dependencies(def: &FunctionDefinition) -> FastHashSet<String> {
+fn find_function_deps(def: &FunctionDefinition) -> FastHashSet<String> {
     let mut deps = FastHashSet::default();
     for stmt in &def.statement.statement_list {
         find_stmt_deps(stmt, &mut deps)

@@ -1477,6 +1477,7 @@ dependencies = [
  "itertools 0.13.0",
  "naga",
  "nalgebra",
+ "nom",
  "petgraph",
  "pollster",
  "rayon",
