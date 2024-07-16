@@ -492,8 +492,9 @@ impl WgpuState {
 
         let preimage_size = std::mem::size_of_val(preimage) as wgpu::BufferAddress;
 
-        self.write_buffer(&self.dataset_stage, 0, &row_major_preimage);
-        self.write_buffer(&self.dataset_stage, preimage_size, &image);
+        self.write_buffer(&self.dataset_stage, 0, &row_major_preimage, false);
+        self.write_buffer(&self.dataset_stage, preimage_size, image, false);
+        self.dataset_stage.unmap();
         self.copy_buffer(
             &self.dataset_stage,
             &self.dataset_storage,
@@ -508,13 +509,18 @@ impl WgpuState {
         stage: &wgpu::Buffer,
         offset: wgpu::BufferAddress,
         data: &[T],
+        map: bool,
     ) {
         let data_size = std::mem::size_of_val(data) as wgpu::BufferAddress;
         assert!(stage.size() >= data_size + offset);
 
         let data_bytes = data.iter().flat_map(bytemuck::bytes_of).copied();
         let stage_slice = stage.slice(offset..offset + data_size);
-        let mut mapping = Self::map_buffer_mut(stage_slice);
+        let mut mapping = if map {
+            Self::map_buffer_mut(&self.device, stage_slice)
+        } else {
+            stage_slice.get_mapped_range_mut()
+        };
         for (src, dst) in data_bytes.zip_eq(mapping.iter_mut()) {
             *dst = src;
         }
@@ -528,12 +534,17 @@ impl WgpuState {
         offset: wgpu::BufferAddress,
         count: usize,
         destination: &mut Vec<T>,
+        map: bool,
     ) {
         let data_size = (size_of::<T>() * count) as wgpu::BufferAddress;
         assert!(stage.size() >= offset + data_size);
 
         let stage_slice = stage.slice(offset..offset + data_size);
-        let mapping = Self::map_buffer(stage_slice);
+        let mapping = if map {
+            Self::map_buffer(&self.device, stage_slice)
+        } else {
+            stage_slice.get_mapped_range()
+        };
 
         destination.extend(
             mapping
@@ -561,18 +572,26 @@ impl WgpuState {
             .is_queue_empty())
     }
 
-    fn map_buffer(slice: wgpu::BufferSlice) -> wgpu::BufferView {
+    fn map_buffer<'a>(
+        device: &wgpu::Device,
+        slice: wgpu::BufferSlice<'a>,
+    ) -> wgpu::BufferView<'a> {
         let (tx, rx) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        device.poll(wgpu::Maintain::Wait);
         rx.recv()
             .expect("could not map buffer slice")
             .expect("could not map buffer slice");
         slice.get_mapped_range()
     }
 
-    fn map_buffer_mut(slice: wgpu::BufferSlice) -> wgpu::BufferViewMut {
+    fn map_buffer_mut<'a>(
+        device: &wgpu::Device,
+        slice: wgpu::BufferSlice<'a>,
+    ) -> wgpu::BufferViewMut<'a> {
         let (tx, rx) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Write, move |r| tx.send(r).unwrap());
+        device.poll(wgpu::Maintain::Wait);
         rx.recv()
             .expect("could not map buffer slice")
             .expect("could not map buffer slice");
