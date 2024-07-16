@@ -29,7 +29,7 @@ pub struct Function<T, F> {
 }
 
 pub trait Tree {
-    type T: Clone;
+    type T;
     fn size(&self) -> usize;
 }
 

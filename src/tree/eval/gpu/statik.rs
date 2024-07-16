@@ -1,17 +1,16 @@
+use crevice::std430::AsStd430;
+use itertools::Itertools;
+use nalgebra::DMatrix;
 use std::borrow::Cow;
 use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::mpsc;
-
-use crevice::std430::AsStd430;
-use itertools::Itertools;
-use nalgebra::DMatrix;
 use wgpu::naga::FastHashMap;
 
+use crate::tree::Tree;
+use shader::generate_shader;
 use shader::FunctionSanitizeError;
-
-use crate::tree::eval::gpu::statik::shader::generate_shader;
 
 mod shader;
 
@@ -19,9 +18,21 @@ pub struct StaticEvaluator {
     functions: FastHashMap<usize, crate::ops::gpu::Function>,
     function_names: FastHashMap<crate::ops::gpu::Function, String>,
     wgpu_state: WgpuState,
+    batch_size: NonZeroUsize,
+    permutations: NonZeroUsize,
+    max_tree_size: NonZeroUsize,
+    max_constant_pool_size: NonZeroUsize,
     preimage: DMatrix<f32>,
     image: Box<[f32]>,
-    constant_pool_size: NonZeroUsize,
+    evaluation: Evaluation,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Evaluation {
+    tree: Option<crate::tree::Node<f32, crate::ops::gpu::Function>>,
+    batch: Option<Vec<usize>>,
+    constants: Option<Vec<f32>>,
+    permutations: Option<DMatrix<bool>>,
 }
 
 struct WgpuState {
@@ -35,11 +46,21 @@ struct WgpuState {
     sampling_storage: wgpu::Buffer,
     tree_storage: wgpu::Buffer,
     result_storage: wgpu::Buffer,
+    preimage_range: Range<wgpu::BufferAddress>,
+    image_range: Range<wgpu::BufferAddress>,
+    constant_pool_range: Range<wgpu::BufferAddress>,
+    batch_range: Range<wgpu::BufferAddress>,
+    permutation_range: Range<wgpu::BufferAddress>,
     dataset_bind_group: wgpu::BindGroup,
     sampling_bind_group: wgpu::BindGroup,
     eval_bind_group: wgpu::BindGroup,
     pipeline: wgpu::ComputePipeline,
     workgroup_size: [u32; 3],
+    tree: Vec<rpn::Std140TreeNode>,
+    batch: Vec<u32>,
+    constant_pool: Vec<f32>,
+    prefactors: Vec<f32>,
+    msd: Vec<f32>,
 }
 
 #[derive(crevice::std430::AsStd430)]
@@ -52,21 +73,15 @@ struct PushConstants {
 #[derive(thiserror::Error, Debug)]
 pub enum StaticEvaluatorError {
     #[error(
-        r"preimage and image must be nonempty and have the same number of rows
-         (preimage has {preimage_rows}, image has {image_rows})"
+        "preimage and image must be nonempty and have the same number of rows \
+        (preimage has {preimage_rows}, image has {image_rows})"
     )]
     Dataset {
         preimage_rows: usize,
         image_rows: usize,
     },
-    #[error(
-        r"batch size must not be larger than preimage
-         (batch size: {batch_size}, preimage: {preimage_rows} rows)"
-    )]
-    BatchSize {
-        batch_size: NonZeroUsize,
-        preimage_rows: usize,
-    },
+    #[error("batch size too large (maximum: {max}, actual: {actual})")]
+    BatchSize { max: usize, actual: usize },
     #[error("shader contains cycle")]
     Cycle(String),
     #[error("shaderc error")]
@@ -77,6 +92,47 @@ pub enum StaticEvaluatorError {
     FunctionSanitize(#[from] FunctionSanitizeError),
     #[error("WGPU error: {0}")]
     Wgpu(String),
+    #[error("tree, batch, constants and permutations must be initialised")]
+    NotInitialised,
+    #[error("tree is too large (maxim size: {max_size}, actual size: {actual_size})")]
+    TreeTooLarge { max_size: usize, actual_size: usize },
+    #[error(
+        "constant pool is too large (max size: {max_size}, actual size: {actual_size})"
+    )]
+    ConstantPoolTooLarge { max_size: usize, actual_size: usize },
+    #[error("batch index {bad_index} at position {position} out of dataset range ({dataset_size} rows)")]
+    BadBatch {
+        bad_index: usize,
+        position: usize,
+        dataset_size: usize,
+    },
+    #[error(
+        "permutation matrix has illegal dimensions (\
+        expected rows: {expected_rows}, \
+        actual rows: {actual_rows}; \
+        minimum columns: {min_columns}, \
+        maximum columns: {max_columns}, \
+        actual columns: {actual_columns})"
+    )]
+    BadPermutationDimensions {
+        actual_rows: usize,
+        actual_columns: usize,
+        expected_rows: usize,
+        min_columns: usize,
+        max_columns: usize,
+    },
+    #[error("function {id} has wrong arity (expected: {expected}, actual: {actual})")]
+    BadArity {
+        id: usize,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("unknown function (id: {0})")]
+    UnknownFunction(usize),
+    #[error("unknown constant (idx: {idx}, pool size: {pool_size})")]
+    UnknownConstant { idx: usize, pool_size: usize },
+    #[error("unknown variable (idx: {idx}, sample dimensions: {dimensions})")]
+    UnknownVariable { idx: usize, dimensions: usize },
 }
 
 mod rpn {
@@ -89,13 +145,13 @@ mod rpn {
 
     #[derive(crevice::std140::AsStd140)]
     pub struct TreeNode {
-        opkind: u32,
-        immediate: u32,
-        function_id: u32,
+        pub(super) opkind: u32,
+        pub(super) immediate: u32,
+        pub(super) function_id: u32,
     }
 
     impl TreeNode {
-        pub fn traverse(root: &Node<f32, Function>, stack: &mut Vec<Self>) {
+        pub fn traverse(root: &Node<f32, Function>, mut stack: Vec<Self>) -> Vec<Self> {
             match root {
                 | Node::Constant(constant) => stack.push(Self {
                     opkind: OPKIND_CONSTANT as u32,
@@ -114,10 +170,11 @@ mod rpn {
                         function_id: function.function.id() as u32,
                     });
                     for operand in &*function.operands {
-                        Self::traverse(operand, stack);
+                        stack = Self::traverse(operand, stack);
                     }
                 }
             }
+            stack
         }
     }
 }
@@ -129,7 +186,7 @@ impl StaticEvaluator {
         batch_size: NonZeroUsize,
         permutations: NonZeroUsize,
         max_tree_size: NonZeroUsize,
-        constant_pool_size: NonZeroUsize,
+        max_constant_pool_size: NonZeroUsize,
         preimage: DMatrix<f32>,
         image: Box<[f32]>,
     ) -> Result<Self, StaticEvaluatorError> {
@@ -142,8 +199,8 @@ impl StaticEvaluator {
 
         if batch_size.get() > preimage.nrows() {
             return Err(StaticEvaluatorError::BatchSize {
-                batch_size,
-                preimage_rows: preimage.nrows(),
+                actual: batch_size.get(),
+                max: preimage.nrows(),
             });
         }
 
@@ -172,7 +229,7 @@ impl StaticEvaluator {
             batch_size,
             permutations,
             max_tree_size,
-            constant_pool_size,
+            max_constant_pool_size,
             naga_module,
             workgroup_size,
         )?;
@@ -181,10 +238,250 @@ impl StaticEvaluator {
             functions,
             function_names,
             wgpu_state,
+            batch_size,
+            permutations,
+            max_tree_size,
+            max_constant_pool_size,
             preimage,
             image,
-            constant_pool_size,
+            evaluation: Default::default(),
         })
+    }
+
+    pub fn evaluate(
+        &mut self,
+        evaluation: Evaluation,
+    ) -> Result<&[f32], StaticEvaluatorError> {
+        if cfg!(debug_assertions)
+            && (self.evaluation.tree.is_none() && evaluation.tree.is_none()
+                || self.evaluation.batch.is_none() && evaluation.batch.is_none()
+                || self.evaluation.constants.is_none() && evaluation.constants.is_none()
+                || self.evaluation.permutations.is_none()
+                    && evaluation.permutations.is_none())
+        {
+            return Err(StaticEvaluatorError::NotInitialised);
+        }
+
+        let rpn = if let Some(tree) = evaluation.tree.as_ref() {
+            Some(if cfg!(debug_assertions) {
+                self.validate_tree(
+                    tree,
+                    evaluation
+                        .constants
+                        .as_ref()
+                        .or(self.evaluation.constants.as_ref())
+                        .expect("constants must be initialised")
+                        .len(),
+                )?
+            } else {
+                rpn::TreeNode::traverse(tree, Vec::with_capacity(tree.size()))
+            })
+        } else {
+            None
+        };
+
+        if let Some(constants) = evaluation.constants.as_ref() {
+            if cfg!(debug_assertions) {
+                self.validate_constants(constants);
+            }
+        }
+
+        if let Some(batch) = evaluation.batch.as_ref() {
+            if cfg!(debug_assertions) {
+                self.validate_batch(batch);
+            }
+        }
+
+        if let Some(permutations) = evaluation.permutations.as_ref() {
+            if cfg!(debug_assertions) {
+                self.validate_permutations(permutations);
+            }
+        }
+
+        if let Some(tree) = evaluation.tree {
+            let rpn = rpn.unwrap();
+            self.wgpu_state.upload_tree(&rpn);
+            self.evaluation.tree.replace(tree);
+        }
+
+        if let Some(batch) = evaluation.batch {
+            self.wgpu_state.upload_batch(&batch);
+            self.evaluation.batch.replace(batch);
+        }
+
+        if let Some(constants) = evaluation.constants {
+            self.wgpu_state.upload_constants(&constants);
+            self.evaluation.constants.replace(constants);
+        }
+
+        if let Some(permutations) = evaluation.permutations {
+            self.wgpu_state.upload_permutations(&permutations);
+            self.evaluation.permutations.replace(permutations);
+        }
+
+        self.wgpu_state.run_evaluation();
+
+        let msd = self.wgpu_state.download_msd();
+
+        Ok(msd)
+    }
+
+    fn validate_tree(
+        &self,
+        root: &crate::tree::Node<f32, crate::ops::gpu::Function>,
+        constant_pool_size: usize,
+    ) -> Result<Vec<rpn::TreeNode>, StaticEvaluatorError> {
+        let tree_size = root.size();
+        if tree_size > self.max_tree_size.get() {
+            return Err(StaticEvaluatorError::TreeTooLarge {
+                max_size: self.max_tree_size.get(),
+                actual_size: tree_size,
+            });
+        }
+
+        let rpn = rpn::TreeNode::traverse(root, Vec::with_capacity(tree_size));
+
+        for &rpn::TreeNode {
+            opkind,
+            immediate,
+            function_id,
+        } in &rpn
+        {
+            match opkind as usize {
+                | rpn::OPKIND_VARIABLE => {
+                    let id = immediate as usize;
+                    if !(0..self.preimage.ncols()).contains(&id) {
+                        return Err(StaticEvaluatorError::UnknownVariable {
+                            idx: id,
+                            dimensions: self.preimage.ncols(),
+                        });
+                    }
+                }
+                | rpn::OPKIND_CONSTANT => {
+                    let id = immediate as usize;
+                    if !(0..constant_pool_size).contains(&id) {
+                        return Err(StaticEvaluatorError::UnknownConstant {
+                            idx: id,
+                            pool_size: constant_pool_size,
+                        });
+                    }
+                }
+                | rpn::OPKIND_FUNCTION => {
+                    let function_id = function_id as usize;
+                    let Some(function) = self.functions.get(&function_id) else {
+                        return Err(StaticEvaluatorError::UnknownFunction(function_id));
+                    };
+                    let arity = immediate as usize;
+                    let expected_arity = function.arity;
+                    if expected_arity != immediate as usize {
+                        return Err(StaticEvaluatorError::BadArity {
+                            id: function_id,
+                            expected: expected_arity,
+                            actual: arity,
+                        });
+                    }
+                }
+
+                | opkind => panic!("illegal opkind {opkind}"),
+            }
+        }
+
+        Ok(rpn)
+    }
+
+    fn validate_batch(&self, batch: &[usize]) -> Result<(), StaticEvaluatorError> {
+        if batch.len() > self.batch_size.get() {
+            return Err(StaticEvaluatorError::BatchSize {
+                actual: batch.len(),
+                max: self.batch_size.get(),
+            });
+        }
+
+        if let Some((pos, idx)) = batch
+            .iter()
+            .enumerate()
+            .find(|(pos, idx)| **idx > self.preimage.nrows())
+        {
+            return Err(StaticEvaluatorError::BadBatch {
+                bad_index: *idx,
+                position: pos,
+                dataset_size: self.preimage.nrows(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn validate_constants(&self, constants: &[f32]) -> Result<(), StaticEvaluatorError> {
+        if constants.len() > self.max_constant_pool_size.get() {
+            return Err(StaticEvaluatorError::ConstantPoolTooLarge {
+                max_size: self.max_constant_pool_size.get(),
+                actual_size: constants.len(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_permutations(
+        &self,
+        permutations: &DMatrix<bool>,
+    ) -> Result<(), StaticEvaluatorError> {
+        let tree_size = self.wgpu_state.tree.len();
+        if permutations.nrows() != self.permutations.get()
+            || !(tree_size..=self.max_tree_size.get()).contains(&permutations.ncols())
+        {
+            return Err(StaticEvaluatorError::BadPermutationDimensions {
+                actual_rows: permutations.nrows(),
+                actual_columns: permutations.ncols(),
+                expected_rows: self.permutations.get(),
+                min_columns: tree_size,
+                max_columns: self.max_tree_size.get(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Evaluation {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub fn tree(self, tree: crate::tree::Node<f32, crate::ops::gpu::Function>) -> Self {
+        Self {
+            tree: Some(tree),
+            ..self
+        }
+    }
+
+    pub fn batch(self, batch: Vec<usize>) -> Self {
+        Self {
+            batch: Some(batch),
+            ..self
+        }
+    }
+
+    pub fn constants(self, constants: Vec<f32>) -> Self {
+        Self {
+            constants: Some(constants),
+            ..self
+        }
+    }
+
+    pub fn permutations(self, permutations: DMatrix<bool>) -> Self {
+        Self {
+            permutations: Some(permutations),
+            ..self
+        }
+    }
+
+    pub fn or(self, other: Self) -> Self {
+        Self {
+            tree: self.tree.or(other.tree),
+            batch: self.batch.or(other.batch),
+            constants: self.constants.or(other.constants),
+            permutations: self.permutations.or(other.permutations),
+        }
     }
 }
 
@@ -196,7 +493,7 @@ impl WgpuState {
         batch_size: NonZeroUsize,
         permutations: NonZeroUsize,
         max_tree_size: NonZeroUsize,
-        constant_pool_size: NonZeroUsize,
+        max_constant_pool_size: NonZeroUsize,
         naga_module: naga::Module,
         workgroup_size: [u32; 3],
     ) -> Result<Self, StaticEvaluatorError> {
@@ -248,7 +545,7 @@ impl WgpuState {
             (preimage.len() * size_of::<f32>()) as wgpu::BufferAddress;
         let image_buffer_size = std::mem::size_of_val(image) as wgpu::BufferAddress;
         let constant_pool_buffer_size =
-            (constant_pool_size.get() * size_of::<f32>()) as wgpu::BufferAddress;
+            (max_constant_pool_size.get() * size_of::<f32>()) as wgpu::BufferAddress;
         let batch_buffer_size =
             (batch_size.get() * size_of::<u32>()) as wgpu::BufferAddress;
         let permutation_buffer_size =
@@ -264,13 +561,24 @@ impl WgpuState {
 
         let preimage_offset = align(0, alignment);
         let image_offset = align(preimage_offset + preimage_buffer_size, alignment);
-        let dataset_buffer_size = image_offset + image_buffer_size;
 
         let constant_pool_offset = align(0, alignment);
         let batch_offset =
             align(constant_pool_offset + constant_pool_buffer_size, alignment);
         let permutation_offset = align(batch_offset + batch_buffer_size, alignment);
-        let sampling_buffer_size = permutation_offset + permutation_buffer_size;
+
+        let preimage_range = preimage_offset..preimage_buffer_size;
+        let image_range = image_offset..image_buffer_size;
+
+        let constant_pool_range = constant_pool_offset..constant_pool_buffer_size;
+        let batch_range = batch_offset..batch_buffer_size;
+        let permutation_range = permutation_offset..permutation_buffer_size;
+
+        let dataset_buffer_size =
+            (image_range.start..preimage_range.end).try_len().unwrap();
+        let sampling_buffer_size = (constant_pool_range.start..permutation_range.end)
+            .try_len()
+            .unwrap();
 
         let dataset_stage = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -475,16 +783,50 @@ impl WgpuState {
             sampling_storage,
             tree_storage,
             result_storage,
+            preimage_range,
+            image_range,
+            constant_pool_range,
+            batch_range,
+            permutation_range,
             dataset_bind_group,
             sampling_bind_group,
             eval_bind_group,
             pipeline,
             workgroup_size,
+            tree: Vec::with_capacity(max_tree_size.get()),
+            batch: Vec::with_capacity(batch_size.get()),
+            constant_pool: Vec::with_capacity(max_constant_pool_size.get()),
+            prefactors: Vec::with_capacity(permutations.get() * max_tree_size.get()),
+            msd: Vec::with_capacity(permutations.get()),
         };
 
         wgpu_state.upload_dataset(preimage, image);
 
         Ok(wgpu_state)
+    }
+
+    pub fn upload_tree(&mut self, tree: &[rpn::TreeNode]) {
+        todo!()
+    }
+
+    pub fn upload_batch(&mut self, batch: &[usize]) {
+        todo!()
+    }
+
+    pub fn upload_constants(&mut self, constants: &[f32]) {
+        todo!()
+    }
+
+    pub fn upload_permutations(&mut self, permutations: &DMatrix<bool>) {
+        todo!()
+    }
+
+    pub fn run_evaluation(&self) {
+        todo!()
+    }
+
+    pub fn download_msd(&mut self) -> &[f32] {
+        todo!()
     }
 
     fn upload_dataset(&self, preimage: &DMatrix<f32>, image: &[f32]) {
@@ -695,14 +1037,14 @@ mod tests {
         let batch_size = 64.try_into().unwrap();
         let permutations = 32.try_into().unwrap();
         let max_tree_size = 96.try_into().unwrap();
-        let constant_pool_size = 16.try_into().unwrap();
+        let max_constant_pool_size = 16.try_into().unwrap();
 
         StaticEvaluator::new(
             defs,
             batch_size,
             permutations,
             max_tree_size,
-            constant_pool_size,
+            max_constant_pool_size,
             preimage,
             image,
         )
