@@ -1,0 +1,21 @@
+grammar;
+
+use std::str::FromStr;
+
+pub Expression: crate::ast::Node = {
+    <Function> => <>.into(),
+    <Constant> => <>.into(),
+    "(" <Expression> ")" => <>.into(),
+}
+
+Function: crate::ast::Function = {
+    "(" <ident:Ident> <args:(<Expression>)*> ")" => crate::ast::Function {<>}
+}
+
+Constant: f32 = {
+    r"[+-]?\d+(\.\d+)?([eE][+-]?\d+)?" => f32::from_str(<>).unwrap()
+}
+
+Ident: smol_str::SmolStr = {
+    r"[a-zA-Z_][\w_]*" => smol_str::SmolStr::new(<>)
+}
