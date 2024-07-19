@@ -1,3 +1,4 @@
+use crevice::std140::AsStd140;
 use crevice::std430::AsStd430;
 use itertools::Itertools;
 use nalgebra::DMatrix;
@@ -38,10 +39,10 @@ pub struct Evaluation {
 struct WgpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    dataset_stage: wgpu::Buffer,
-    sampling_stage: wgpu::Buffer,
-    tree_stage: wgpu::Buffer,
-    result_stage: wgpu::Buffer,
+    dataset_staging: wgpu::Buffer,
+    sampling_staging: wgpu::Buffer,
+    tree_staging: wgpu::Buffer,
+    result_staging: wgpu::Buffer,
     dataset_storage: wgpu::Buffer,
     sampling_storage: wgpu::Buffer,
     tree_storage: wgpu::Buffer,
@@ -81,7 +82,7 @@ pub enum StaticEvaluatorError {
         image_rows: usize,
     },
     #[error("batch size too large (maximum: {max}, actual: {actual})")]
-    BatchSize { max: usize, actual: usize },
+    BatchTooLarge { max: usize, actual: usize },
     #[error("shader contains cycle")]
     Cycle(String),
     #[error("shaderc error")]
@@ -100,6 +101,8 @@ pub enum StaticEvaluatorError {
         "constant pool is too large (max size: {max_size}, actual size: {actual_size})"
     )]
     ConstantPoolTooLarge { max_size: usize, actual_size: usize },
+    #[error("batch must have previously configured size (expected size: {expected}, actual size: {actual})")]
+    BatchSize { expected: usize, actual: usize },
     #[error("batch index {bad_index} at position {position} out of dataset range ({dataset_size} rows)")]
     BadBatch {
         bad_index: usize,
@@ -198,7 +201,7 @@ impl StaticEvaluator {
         }
 
         if batch_size.get() > preimage.nrows() {
-            return Err(StaticEvaluatorError::BatchSize {
+            return Err(StaticEvaluatorError::BatchTooLarge {
                 actual: batch_size.get(),
                 max: preimage.nrows(),
             });
@@ -217,6 +220,7 @@ impl StaticEvaluator {
             functions,
             batch_size.get(),
             permutations.get(),
+            max_tree_size.get(),
             max_tree_size.get(),
             workgroup_size,
         )?;
@@ -279,6 +283,10 @@ impl StaticEvaluator {
         } else {
             None
         };
+        let tree_size = rpn
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or(self.wgpu_state.tree.len());
 
         if let Some(constants) = evaluation.constants.as_ref() {
             if cfg!(debug_assertions) {
@@ -292,14 +300,23 @@ impl StaticEvaluator {
             }
         }
 
-        if let Some(permutations) = evaluation.permutations.as_ref() {
-            if cfg!(debug_assertions) {
-                self.validate_permutations(permutations);
-            }
+        if cfg!(debug_assertions) {
+            let permutations =
+                if let Some(permutations) = evaluation.permutations.as_ref() {
+                    permutations
+                } else if let Some(permutations) = self.evaluation.permutations.as_ref() {
+                    permutations
+                } else {
+                    unreachable!(
+                        "either old or new permutations should be present by this point"
+                    )
+                };
+            self.validate_permutations(permutations, tree_size);
         }
 
         if let Some(tree) = evaluation.tree {
-            let rpn = rpn.unwrap();
+            let rpn =
+                rpn.expect("if evaluation.tree is present, then rpn should be, too");
             self.wgpu_state.upload_tree(&rpn);
             self.evaluation.tree.replace(tree);
         }
@@ -315,8 +332,10 @@ impl StaticEvaluator {
         }
 
         if let Some(permutations) = evaluation.permutations {
-            self.wgpu_state.upload_permutations(&permutations);
-            self.evaluation.permutations.replace(permutations);
+            let columns = permutations.ncols();
+            let padded = permutations.insert_columns(columns, columns - tree_size, false);
+            self.wgpu_state.upload_permutations(&padded);
+            self.evaluation.permutations.replace(padded);
         }
 
         self.wgpu_state.run_evaluation();
@@ -390,10 +409,10 @@ impl StaticEvaluator {
     }
 
     fn validate_batch(&self, batch: &[usize]) -> Result<(), StaticEvaluatorError> {
-        if batch.len() > self.batch_size.get() {
+        if batch.len() != self.batch_size.get() {
             return Err(StaticEvaluatorError::BatchSize {
                 actual: batch.len(),
-                max: self.batch_size.get(),
+                expected: self.batch_size.get(),
             });
         }
 
@@ -425,8 +444,8 @@ impl StaticEvaluator {
     fn validate_permutations(
         &self,
         permutations: &DMatrix<bool>,
+        tree_size: usize,
     ) -> Result<(), StaticEvaluatorError> {
-        let tree_size = self.wgpu_state.tree.len();
         if permutations.nrows() != self.permutations.get()
             || !(tree_size..=self.max_tree_size.get()).contains(&permutations.ncols())
         {
@@ -568,71 +587,73 @@ impl WgpuState {
             align(constant_pool_offset + constant_pool_buffer_size, alignment);
         let permutation_offset = align(batch_offset + batch_buffer_size, alignment);
 
-        let preimage_range = preimage_offset..preimage_buffer_size;
-        let image_range = image_offset..image_buffer_size;
+        let preimage_range = preimage_offset..preimage_offset + preimage_buffer_size;
+        let image_range = image_offset..image_offset + image_buffer_size;
 
         let constant_pool_range = constant_pool_offset..constant_pool_buffer_size;
-        let batch_range = batch_offset..batch_buffer_size;
-        let permutation_range = permutation_offset..permutation_buffer_size;
+        let batch_range = batch_offset..batch_offset + batch_buffer_size;
+        let permutation_range =
+            permutation_offset..permutation_offset + permutation_buffer_size;
 
-        let dataset_buffer_size =
-            (image_range.start..preimage_range.end).try_len().unwrap();
+        let dataset_buffer_size = (preimage_range.start..image_range.end)
+            .try_len()
+            .expect("preimage range should be bounded");
         let sampling_buffer_size = (constant_pool_range.start..permutation_range.end)
             .try_len()
-            .unwrap();
+            .expect("constant pool range should be bounded");
 
-        let dataset_stage = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
+        let dataset_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dataset_staging"),
             size: dataset_buffer_size as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: true,
         });
 
-        let sampling_stage = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
+        let sampling_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sampling_staging"),
             size: sampling_buffer_size as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::MAP_WRITE,
             mapped_at_creation: false,
         });
 
-        let tree_stage = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
+        let tree_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tree_staging"),
             size: result_buffer_size as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::MAP_WRITE,
             mapped_at_creation: false,
         });
 
-        let result_stage = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
+        let result_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("result_staging"),
             size: result_buffer_size as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
 
         let dataset_storage = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: dataset_stage.size(),
+            label: Some("dataset_storage"),
+            size: dataset_staging.size(),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
         let sampling_storage = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: sampling_stage.size(),
+            label: Some("sampling_storage"),
+            size: sampling_staging.size(),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
         let tree_storage = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: tree_stage.size(),
+            label: Some("tree_storage"),
+            size: tree_staging.size(),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
         let result_storage = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: result_stage.size(),
+            label: Some("result_storage"),
+            size: result_staging.size(),
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -658,7 +679,7 @@ impl WgpuState {
 
         let dataset_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: None,
+                label: Some("dataset_bind_group_layout"),
                 entries: &[
                     bind_group_layout_entry(0, preimage_buffer_size, true),
                     bind_group_layout_entry(1, image_buffer_size, true),
@@ -666,7 +687,7 @@ impl WgpuState {
             });
         let sampling_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: None,
+                label: Some("sampling_bind_group_layout"),
                 entries: &[
                     bind_group_layout_entry(0, constant_pool_buffer_size, true),
                     bind_group_layout_entry(1, batch_buffer_size, true),
@@ -675,7 +696,7 @@ impl WgpuState {
             });
         let eval_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: None,
+                label: Some("eval_bind_group_layout"),
                 entries: &[
                     bind_group_layout_entry(0, tree_buffer_size, true),
                     bind_group_layout_entry(1, result_buffer_size, false),
@@ -683,7 +704,7 @@ impl WgpuState {
             });
 
         let dataset_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
+            label: Some("dataset_bind_group"),
             layout: &dataset_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -706,7 +727,7 @@ impl WgpuState {
         });
 
         let sampling_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
+            label: Some("sampling_bind_group"),
             layout: &sampling_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -737,7 +758,7 @@ impl WgpuState {
         });
 
         let eval_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
+            label: Some("eval_bind_group"),
             layout: &eval_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -753,7 +774,7 @@ impl WgpuState {
 
         let pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
+                label: Some("eval_pipeline_layout"),
                 bind_group_layouts: &[
                     &dataset_bind_group_layout,
                     &sampling_bind_group_layout,
@@ -766,7 +787,7 @@ impl WgpuState {
             });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: None,
+            label: Some("eval_pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader_module,
             entry_point: "main",
@@ -777,10 +798,10 @@ impl WgpuState {
         let wgpu_state = Self {
             device,
             queue,
-            dataset_stage,
-            sampling_stage,
-            tree_stage,
-            result_stage,
+            dataset_staging,
+            sampling_staging,
+            tree_staging,
+            result_staging,
             dataset_storage,
             sampling_storage,
             tree_storage,
@@ -807,63 +828,142 @@ impl WgpuState {
         Ok(wgpu_state)
     }
 
-    pub fn upload_tree(&mut self, tree: &[rpn::TreeNode]) {
-        todo!()
-    }
-
-    pub fn upload_batch(&mut self, batch: &[usize]) {
-        todo!()
-    }
-
-    pub fn upload_constants(&mut self, constants: &[f32]) {
-        todo!()
-    }
-
-    pub fn upload_permutations(&mut self, permutations: &DMatrix<bool>) {
-        todo!()
-    }
-
-    pub fn run_evaluation(&self) {
-        todo!()
-    }
-
-    pub fn download_msd(&mut self) -> &[f32] {
-        todo!()
-    }
-
     fn upload_dataset(&self, preimage: &DMatrix<f32>, image: &[f32]) {
         let row_major_preimage = preimage.transpose().iter().copied().collect_vec();
 
         let preimage_size = std::mem::size_of_val(preimage) as wgpu::BufferAddress;
 
-        self.write_buffer(&self.dataset_stage, 0, &row_major_preimage, false);
-        self.write_buffer(&self.dataset_stage, preimage_size, image, false);
-        self.dataset_stage.unmap();
+        self.write_buffer(&self.dataset_staging, 0, &row_major_preimage, false);
+        self.write_buffer(&self.dataset_staging, preimage_size, image, false);
+        self.dataset_staging.unmap();
         self.copy_buffer(
-            &self.dataset_stage,
+            &self.dataset_staging,
             &self.dataset_storage,
             0,
             0,
-            self.dataset_stage.size(),
+            self.dataset_staging.size(),
         );
+    }
+
+    fn upload_tree(&mut self, tree: &[rpn::TreeNode]) {
+        self.tree.clear();
+        self.tree
+            .extend(tree.iter().map(<rpn::TreeNode as AsStd140>::as_std140));
+        self.write_buffer(&self.tree_staging, 0, &self.tree, true);
+        self.tree_staging.unmap();
+        self.copy_buffer(
+            &self.tree_staging,
+            &self.tree_storage,
+            0,
+            0,
+            self.tree_staging.size(),
+        );
+    }
+
+    fn upload_batch(&mut self, batch: &[usize]) {
+        self.batch.clear();
+        self.batch
+            .extend(batch.iter().copied().map(|idx| idx as u32));
+        self.write_buffer(
+            &self.sampling_staging,
+            self.batch_range.start,
+            &self.batch,
+            true,
+        );
+        self.sampling_staging.unmap();
+        self.copy_buffer(
+            &self.sampling_staging,
+            &self.sampling_storage,
+            self.batch_range.start,
+            self.batch_range.start,
+            self.batch_range.end - self.batch_range.start,
+        );
+    }
+
+    fn upload_constants(&mut self, constants: &[f32]) {
+        self.constant_pool.clear();
+        self.constant_pool.extend_from_slice(constants);
+        self.write_buffer(
+            &self.sampling_staging,
+            self.constant_pool_range.start,
+            &self.constant_pool,
+            true,
+        );
+        self.sampling_staging.unmap();
+        self.copy_buffer(
+            &self.sampling_staging,
+            &self.sampling_storage,
+            self.constant_pool_range.start,
+            self.constant_pool_range.start,
+            self.constant_pool_range.end - self.constant_pool_range.start,
+        );
+    }
+
+    fn upload_permutations(&mut self, permutations: &DMatrix<bool>) {
+        self.prefactors.clear();
+        self.prefactors.extend(
+            permutations
+                .clone()
+                .transpose()
+                .iter()
+                .copied()
+                .map(|idx| idx as u32 as f32),
+        );
+        self.write_buffer(
+            &self.sampling_staging,
+            self.permutation_range.start,
+            &self.prefactors,
+            true,
+        );
+        self.sampling_staging.unmap();
+        self.copy_buffer(
+            &self.sampling_staging,
+            &self.sampling_storage,
+            self.permutation_range.start,
+            self.permutation_range.start,
+            self.permutation_range.end - self.permutation_range.start,
+        );
+    }
+
+    fn run_evaluation(&self) {
+        todo!()
+    }
+
+    fn download_msd(&mut self) -> &[f32] {
+        self.copy_buffer(
+            &self.result_storage,
+            &self.result_staging,
+            0,
+            0,
+            self.result_staging.size(),
+        );
+
+        let mut msd = std::mem::take(&mut self.msd);
+        msd.clear();
+
+        self.read_buffer(&self.result_staging, 0, self.batch.len(), &mut msd, true);
+        self.result_staging.unmap();
+
+        self.msd = msd;
+        &self.msd
     }
 
     fn write_buffer<T: bytemuck::NoUninit>(
         &self,
-        stage: &wgpu::Buffer,
+        staging: &wgpu::Buffer,
         offset: wgpu::BufferAddress,
         data: &[T],
         map: bool,
     ) {
         let data_size = std::mem::size_of_val(data) as wgpu::BufferAddress;
-        assert!(stage.size() >= data_size + offset);
+        assert!(staging.size() >= data_size + offset);
 
         let data_bytes = data.iter().flat_map(bytemuck::bytes_of).copied();
-        let stage_slice = stage.slice(offset..offset + data_size);
+        let staging_slice = staging.slice(offset..offset + data_size);
         let mut mapping = if map {
-            Self::map_buffer_mut(&self.device, stage_slice)
+            Self::map_buffer_mut(&self.device, staging_slice)
         } else {
-            stage_slice.get_mapped_range_mut()
+            staging_slice.get_mapped_range_mut()
         };
         for (src, dst) in data_bytes.zip_eq(mapping.iter_mut()) {
             *dst = src;
@@ -874,20 +974,20 @@ impl WgpuState {
 
     fn read_buffer<T: bytemuck::AnyBitPattern>(
         &self,
-        stage: &wgpu::Buffer,
+        staging: &wgpu::Buffer,
         offset: wgpu::BufferAddress,
         count: usize,
         destination: &mut Vec<T>,
         map: bool,
     ) {
         let data_size = (size_of::<T>() * count) as wgpu::BufferAddress;
-        assert!(stage.size() >= offset + data_size);
+        assert!(staging.size() >= offset + data_size);
 
-        let stage_slice = stage.slice(offset..offset + data_size);
+        let staging_slice = staging.slice(offset..offset + data_size);
         let mapping = if map {
-            Self::map_buffer(&self.device, stage_slice)
+            Self::map_buffer(&self.device, staging_slice)
         } else {
-            stage_slice.get_mapped_range()
+            staging_slice.get_mapped_range()
         };
 
         destination.extend(

@@ -18,6 +18,7 @@ mod macro_identifiers {
     pub const BATCH_SIZE: &str = "BATCH_SIZE";
     pub const PERMUTATIONS: &str = "PERMUTATIONS";
     pub const STACK_SIZE: &str = "STACK_SIZE";
+    pub const MAX_TREE_SIZE: &str = "MAX_TREE_SIZE";
 }
 
 const SHADER_SOURCE: &str = include_str!(crate::proot!("shaders/src/skeleton.comp"));
@@ -28,6 +29,7 @@ pub fn generate_shader(
     batch_size: usize,
     permutations: usize,
     stack_size: usize,
+    max_tree_size: usize,
     workgroup_size: [u32; 3],
 ) -> Result<
     (FastHashMap<crate::ops::gpu::Function, String>, naga::Module),
@@ -48,6 +50,7 @@ pub fn generate_shader(
         (macro_identifiers::BATCH_SIZE, batch_size),
         (macro_identifiers::PERMUTATIONS, permutations),
         (macro_identifiers::STACK_SIZE, stack_size),
+        (macro_identifiers::MAX_TREE_SIZE, max_tree_size),
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -93,7 +96,7 @@ pub fn generate_shader(
     let naga_module = naga_front.parse(&options, &shader_source)?;
     let actual_workgroup_size = naga_front.metadata().workgroup_size;
     debug_assert_eq!(
-        [workgroup_size[0] as u32, workgroup_size[1] as u32, 1],
+        [workgroup_size[0], workgroup_size[1], 1],
         actual_workgroup_size
     );
 

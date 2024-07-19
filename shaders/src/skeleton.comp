@@ -7,6 +7,7 @@
     BATCH_SIZE: batch size; the x dimension of the work group
     PERMUTATIONS: number of permutations; the y dimension of the work group
     STACK_SIZE: size of private stack; should not be smaller than expression tree
+    MAX_TREE_SIZE: maximum tree size; used for stride petween permutation rows
 
     OPKINDs: uint literals
     - OPKIND_VARIABLE
@@ -95,7 +96,7 @@ void main() {
 }
 
 float _prefactor(uint permutationIdx, uint nodeIdx) {
-    return permutationPrefactors[permutationIdx * expressionSize + nodeIdx];
+    return permutationPrefactors[permutationIdx * MAX_TREE_SIZE + nodeIdx];
 }
 
 float _sample(uint batchIdx, uint dimension) {
