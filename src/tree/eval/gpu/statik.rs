@@ -41,8 +41,11 @@ pub struct Evaluation {
 struct WgpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    #[allow(unused)]
     dataset_staging: wgpu::Buffer,
+    #[allow(unused)]
     sampling_staging: wgpu::Buffer,
+    #[allow(unused)]
     tree_staging: wgpu::Buffer,
     result_staging: wgpu::Buffer,
     dataset_storage: wgpu::Buffer,
@@ -1135,5 +1138,55 @@ mod tests {
         assert_eq!(8, align(8, 8));
         assert_eq!(32, align(16, 32));
         assert_eq!(512, align(16, 512));
+    }
+
+    #[test]
+    fn test_evaluation() {
+        // omega_L https://en.wikipedia.org/wiki/RLC_circuit#Sinusoidal_steady_state
+        let ast = crate::parse::ExpressionParser::new()
+            .parse(
+                r"(
+                div 1 (
+                    mul (C) (
+                        sqrt (
+                            sub (
+                                div (L) (C)
+                            ) (
+                                mul (
+                                    div 1 2
+                                ) (
+                                    pow (R) 2
+                                )
+                            )
+                        )
+                    )
+                )
+            )",
+            )
+            .unwrap();
+
+        let cpu_fns: &[(&str, fn(&[f32]) -> f32)] =
+            &[("mul", function::mul), ("div", function::div)];
+    }
+
+    mod function {
+        pub fn add(args: &[f32]) -> f32 {
+            args[0] + args[1]
+        }
+        pub fn sub(args: &[f32]) -> f32 {
+            args[0] - args[1]
+        }
+        pub fn mul(args: &[f32]) -> f32 {
+            args[0] * args[1]
+        }
+        pub fn div(args: &[f32]) -> f32 {
+            args[0] / args[1]
+        }
+        pub fn sqrt(args: &[f32]) -> f32 {
+            args[0].sqrt()
+        }
+        pub fn exp(args: &[f32]) -> f32 {
+            args[0].powf(args[0])
+        }
     }
 }
