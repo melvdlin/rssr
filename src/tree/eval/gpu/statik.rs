@@ -847,15 +847,15 @@ impl WgpuState {
 
         let preimage_size = std::mem::size_of_val(preimage) as wgpu::BufferAddress;
 
-        self.write_buffer(&self.dataset_staging, 0, &row_major_preimage, false);
-        self.write_buffer(&self.dataset_staging, preimage_size, image, false);
-        self.dataset_staging.unmap();
-        self.copy_buffer(
-            &self.dataset_staging,
+        self.queue.write_buffer(
             &self.dataset_storage,
             0,
-            0,
-            self.dataset_staging.size(),
+            bytemuck::cast_slice(&row_major_preimage),
+        );
+        self.queue.write_buffer(
+            &self.dataset_storage,
+            preimage_size,
+            bytemuck::cast_slice(image),
         );
     }
 
@@ -863,53 +863,28 @@ impl WgpuState {
         self.tree.clear();
         self.tree
             .extend(tree.iter().map(<rpn::TreeNode as AsStd140>::as_std140));
-        self.write_buffer(&self.tree_staging, 0, &self.tree, true);
-        self.tree_staging.unmap();
-        self.copy_buffer(
-            &self.tree_staging,
-            &self.tree_storage,
-            0,
-            0,
-            self.tree_staging.size(),
-        );
+        self.queue
+            .write_buffer(&self.tree_storage, 0, bytemuck::cast_slice(&self.tree));
     }
 
     fn upload_batch(&mut self, batch: &[usize]) {
         self.batch.clear();
         self.batch
             .extend(batch.iter().copied().map(|idx| idx as u32));
-        self.write_buffer(
-            &self.sampling_staging,
-            self.batch_range.start,
-            &self.batch,
-            true,
-        );
-        self.sampling_staging.unmap();
-        self.copy_buffer(
-            &self.sampling_staging,
+        self.queue.write_buffer(
             &self.sampling_storage,
             self.batch_range.start,
-            self.batch_range.start,
-            self.batch_range.end - self.batch_range.start,
+            bytemuck::cast_slice(&self.batch),
         );
     }
 
     fn upload_constants(&mut self, constants: &[f32]) {
         self.constant_pool.clear();
         self.constant_pool.extend_from_slice(constants);
-        self.write_buffer(
-            &self.sampling_staging,
-            self.constant_pool_range.start,
-            &self.constant_pool,
-            true,
-        );
-        self.sampling_staging.unmap();
-        self.copy_buffer(
-            &self.sampling_staging,
+        self.queue.write_buffer(
             &self.sampling_storage,
             self.constant_pool_range.start,
-            self.constant_pool_range.start,
-            self.constant_pool_range.end - self.constant_pool_range.start,
+            bytemuck::cast_slice(&self.constant_pool),
         );
     }
 
@@ -922,19 +897,10 @@ impl WgpuState {
                 .copied()
                 .map(|idx| idx as u32 as f32),
         );
-        self.write_buffer(
-            &self.sampling_staging,
-            self.permutation_range.start,
-            &self.prefactors,
-            true,
-        );
-        self.sampling_staging.unmap();
-        self.copy_buffer(
-            &self.sampling_staging,
+        self.queue.write_buffer(
             &self.sampling_storage,
             self.permutation_range.start,
-            self.permutation_range.start,
-            self.permutation_range.end - self.permutation_range.start,
+            bytemuck::cast_slice(&self.prefactors),
         );
     }
 
@@ -992,30 +958,6 @@ impl WgpuState {
         &self.msd
     }
 
-    fn write_buffer<T: bytemuck::NoUninit>(
-        &self,
-        staging: &wgpu::Buffer,
-        offset: wgpu::BufferAddress,
-        data: &[T],
-        map: bool,
-    ) {
-        let data_size = std::mem::size_of_val(data) as wgpu::BufferAddress;
-        assert!(staging.size() >= data_size + offset);
-
-        let data_bytes = data.iter().flat_map(bytemuck::bytes_of).copied();
-        let staging_slice = staging.slice(offset..offset + data_size);
-        let mut mapping = if map {
-            Self::map_buffer_mut(&self.device, staging_slice)
-        } else {
-            staging_slice.get_mapped_range_mut()
-        };
-        for (src, dst) in data_bytes.zip_eq(mapping.iter_mut()) {
-            *dst = src;
-        }
-
-        drop(mapping);
-    }
-
     fn read_buffer<T: bytemuck::AnyBitPattern>(
         &self,
         staging: &wgpu::Buffer,
@@ -1071,19 +1013,6 @@ impl WgpuState {
             .expect("could not map buffer slice")
             .expect("could not map buffer slice");
         slice.get_mapped_range()
-    }
-
-    fn map_buffer_mut<'a>(
-        device: &wgpu::Device,
-        slice: wgpu::BufferSlice<'a>,
-    ) -> wgpu::BufferViewMut<'a> {
-        let (tx, rx) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Write, move |r| tx.send(r).unwrap());
-        device.poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .expect("could not map buffer slice")
-            .expect("could not map buffer slice");
-        slice.get_mapped_range_mut()
     }
 }
 
