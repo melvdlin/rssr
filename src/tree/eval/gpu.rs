@@ -1,2 +1,2 @@
 mod dynamic;
-mod statik;
+pub mod statik;

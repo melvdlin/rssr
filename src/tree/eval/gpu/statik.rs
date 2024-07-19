@@ -1,5 +1,5 @@
 use crevice::std140::AsStd140;
-use crevice::std430::{AsStd430, Std430};
+use crevice::std430::AsStd430;
 use itertools::Itertools;
 use nalgebra::DMatrix;
 use std::borrow::Cow;
@@ -17,6 +17,7 @@ mod shader;
 
 pub struct StaticEvaluator {
     functions: FastHashMap<usize, crate::ops::gpu::Function>,
+    #[allow(unused)]
     function_names: FastHashMap<crate::ops::gpu::Function, String>,
     wgpu_state: WgpuState,
     batch_size: NonZeroUsize,
@@ -24,6 +25,7 @@ pub struct StaticEvaluator {
     max_tree_size: NonZeroUsize,
     max_constant_pool_size: NonZeroUsize,
     preimage: DMatrix<f32>,
+    #[allow(unused)]
     image: Box<[f32]>,
     evaluation: Evaluation,
 }
@@ -47,7 +49,9 @@ struct WgpuState {
     sampling_storage: wgpu::Buffer,
     tree_storage: wgpu::Buffer,
     result_storage: wgpu::Buffer,
+    #[allow(unused)]
     preimage_range: Range<wgpu::BufferAddress>,
+    #[allow(unused)]
     image_range: Range<wgpu::BufferAddress>,
     constant_pool_range: Range<wgpu::BufferAddress>,
     batch_range: Range<wgpu::BufferAddress>,
@@ -59,6 +63,7 @@ struct WgpuState {
     preimage_dimensions: u32,
     batch_size: u32,
     permutations: u32,
+    #[allow(unused)]
     max_workgroup_size: u32,
     workgroup_size: [u32; 3],
     tree: Vec<rpn::Std140TreeNode>,
