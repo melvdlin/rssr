@@ -87,7 +87,7 @@ pub enum StaticEvaluatorError {
     #[error("shaderc error")]
     ShaderC(#[from] Option<shaderc::Error>),
     #[error("naga error: {0}")]
-    Naga(#[from] naga::front::glsl::ParseError),
+    Naga(#[from] naga::front::glsl::ParseErrors),
     #[error("failed to sanitize functions: {0}")]
     FunctionSanitize(#[from] FunctionSanitizeError),
     #[error("WGPU error: {0}")]
@@ -529,6 +529,7 @@ impl WgpuState {
                 required_features: wgpu::Features::PUSH_CONSTANTS
                     | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS,
                 required_limits: limits.clone(),
+                memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
         ))
@@ -770,6 +771,7 @@ impl WgpuState {
             module: &shader_module,
             entry_point: "main",
             compilation_options: Default::default(),
+            cache: None,
         });
 
         let wgpu_state = Self {
