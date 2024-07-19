@@ -1,5 +1,5 @@
 use crevice::std140::AsStd140;
-use crevice::std430::AsStd430;
+use crevice::std430::{AsStd430, Std430};
 use itertools::Itertools;
 use nalgebra::DMatrix;
 use std::borrow::Cow;
@@ -56,6 +56,10 @@ struct WgpuState {
     sampling_bind_group: wgpu::BindGroup,
     eval_bind_group: wgpu::BindGroup,
     pipeline: wgpu::ComputePipeline,
+    preimage_dimensions: u32,
+    batch_size: u32,
+    permutations: u32,
+    max_workgroup_size: u32,
     workgroup_size: [u32; 3],
     tree: Vec<rpn::Std140TreeNode>,
     batch: Vec<u32>,
@@ -66,7 +70,6 @@ struct WgpuState {
 
 #[derive(crevice::std430::AsStd430)]
 struct PushConstants {
-    datapoints: u32,
     preimage_dimensions: u32,
     expression_size: u32,
 }
@@ -235,6 +238,7 @@ impl StaticEvaluator {
             max_tree_size,
             max_constant_pool_size,
             naga_module,
+            max_workgroup_size,
             workgroup_size,
         )?;
 
@@ -514,6 +518,7 @@ impl WgpuState {
         max_tree_size: NonZeroUsize,
         max_constant_pool_size: NonZeroUsize,
         naga_module: naga::Module,
+        max_workgroup_size: NonZeroUsize,
         workgroup_size: [u32; 3],
     ) -> Result<Self, StaticEvaluatorError> {
         assert!(!preimage.is_empty());
@@ -815,6 +820,10 @@ impl WgpuState {
             sampling_bind_group,
             eval_bind_group,
             pipeline,
+            preimage_dimensions: preimage.ncols() as u32,
+            batch_size: batch_size.get() as u32,
+            permutations: permutations.get() as u32,
+            max_workgroup_size: max_workgroup_size.get() as u32,
             workgroup_size,
             tree: Vec::with_capacity(max_tree_size.get()),
             batch: Vec::with_capacity(batch_size.get()),
@@ -903,7 +912,6 @@ impl WgpuState {
         self.prefactors.clear();
         self.prefactors.extend(
             permutations
-                .clone()
                 .transpose()
                 .iter()
                 .copied()
@@ -926,7 +934,38 @@ impl WgpuState {
     }
 
     fn run_evaluation(&self) {
-        todo!()
+        let work_group_counts = [
+            self.batch_size.div_ceil(self.workgroup_size[0]),
+            self.permutations.div_ceil(self.workgroup_size[1]),
+            1,
+        ];
+
+        assert!(self
+            .device
+            .poll(wgpu::Maintain::wait_for(self.queue.submit([{
+                let mut encoder = self.device.create_command_encoder(&Default::default());
+                let mut compute_pass = encoder.begin_compute_pass(&Default::default());
+                compute_pass.set_pipeline(&self.pipeline);
+                compute_pass.set_push_constants(
+                    0,
+                    PushConstants {
+                        preimage_dimensions: self.preimage_dimensions,
+                        expression_size: self.tree.len() as u32,
+                    }
+                    .as_std430()
+                    .as_bytes(),
+                );
+                compute_pass.set_bind_group(0, &self.dataset_bind_group, &[]);
+                compute_pass.set_bind_group(1, &self.sampling_bind_group, &[]);
+                compute_pass.set_bind_group(2, &self.eval_bind_group, &[]);
+                compute_pass.dispatch_workgroups(
+                    work_group_counts[0],
+                    work_group_counts[1],
+                    work_group_counts[2],
+                );
+                encoder.finish()
+            }])))
+            .is_queue_empty());
     }
 
     fn download_msd(&mut self) -> &[f32] {
